@@ -222,6 +222,9 @@ def test_tool_loop_echoes_reasoning_content() -> None:
         model = "deepseek-chat"
         provider = "fake"
 
+        def __init__(self):
+            self._round = 0
+
         async def close(self) -> None:
             pass
 
@@ -229,7 +232,8 @@ def test_tool_loop_echoes_reasoning_content() -> None:
             self, *, messages, request_id, tools=None, rag_chunks=None
         ):
             seen_messages.append(messages)
-            if tools:
+            self._round += 1
+            if self._round == 1:
                 # 第一轮：同一条响应里同时请求知识库检索与联网。
                 yield StreamEvent(
                     kind="tool_call",
@@ -250,7 +254,7 @@ def test_tool_loop_echoes_reasoning_content() -> None:
                     ),
                 )
             else:
-                # 第二轮：基于工具结果生成回答。
+                # 后续轮：基于工具结果生成回答。
                 yield StreamEvent(kind="delta", text="标准版 99 元起")
 
     app.state.llm_client = _FakeLLM()
@@ -273,6 +277,78 @@ def test_tool_loop_echoes_reasoning_content() -> None:
     # 每个工具调用都有对应的 tool 结果。
     tool_msgs = [m for m in round2 if m["role"] == "tool"]
     assert len(tool_msgs) == 2
+
+
+def test_tool_loop_keeps_tools_across_rounds() -> None:
+    """工具循环应在多轮间保留工具定义，让模型可连续调用，直到输出自然语言。"""
+
+    settings = Settings(
+        app_name="Test SaaS AI Assistant API",
+        environment="test",
+        log_level="CRITICAL",
+        llm_api_key="sk-test",
+        llm_base_url="https://api.deepseek.com",
+        llm_model="deepseek-chat",
+    )
+    app = create_app(settings)
+    seen: list[list[dict]] = []
+    tool_seen_per_round: list[bool] = []
+
+    class _FakeLLM:
+        configured = True
+        model = "deepseek-chat"
+        provider = "fake"
+
+        def __init__(self):
+            self._round = 0
+
+        async def close(self) -> None:
+            pass
+
+        async def stream_round(
+            self, *, messages, request_id, tools=None, rag_chunks=None
+        ):
+            seen.append(messages)
+            tool_seen_per_round.append(bool(tools))
+            self._round += 1
+            if self._round == 1:
+                yield StreamEvent(
+                    kind="tool_call",
+                    tool_call=LLMToolCall(
+                        id="c1",
+                        name="web_search",
+                        arguments='{"query": "云枢 CloudHub"}',
+                    ),
+                )
+            elif self._round == 2:
+                # 第二轮仍应拿到工具定义，能再次发起检索。
+                yield StreamEvent(
+                    kind="tool_call",
+                    tool_call=LLMToolCall(
+                        id="c2",
+                        name="retrieve_knowledge_base",
+                        arguments='{"query": "标准版价格"}',
+                    ),
+                )
+            else:
+                yield StreamEvent(kind="delta", text="最终回答")
+
+    app.state.llm_client = _FakeLLM()
+    with TestClient(app) as c:
+        response = c.post(
+            "/api/v1/chat/stream",
+            json={"content": "标准版多少钱", "mode": "auto"},
+        )
+        assert response.status_code == 200
+
+    # 共三轮：两轮工具调用 + 一轮自然语言；工具定义全程保留。
+    assert len(tool_seen_per_round) == 3
+    assert tool_seen_per_round == [True, True, True]
+    # 最终回答来自最后一轮的自然语言，工具调用文本不进入回答。
+    assert '"text": "最终回答"' in response.text
+    # 两个工具调用都被执行并回传对应事件。
+    assert response.text.count('"type": "search"') == 1
+    assert response.text.count('"type": "rag_used"') == 1
 
 
 def test_handoff_creates_ticket(client: TestClient) -> None:

@@ -389,8 +389,11 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                 )
 
             # 工具循环：auto 模式下模型可请求检索知识库或联网，执行后基于结果作答。
-            # 同一条响应可能包含多个工具调用（如同时检索知识库+联网），逐个执行。
-            for _round in range(2):
+            # DeepSeek 推理模型支持连续多轮工具调用：保留工具定义、循环多轮，
+            # 直到模型输出自然语言为止；用轮次上限兜底防死循环。
+            MAX_TOOL_ROUNDS = 4
+            for _round in range(MAX_TOOL_ROUNDS):
+                round_text: list[str] = []
                 tool_calls: list[LLMToolCall] = []
                 async for event in llm.stream_round(
                     messages=turns,
@@ -399,12 +402,17 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                     rag_chunks=rag_chunks,
                 ):
                     if event.kind == "delta":
-                        buffer.append(event.text)
-                        yield _sse({"type": "delta", "text": event.text})
+                        # 先暂存本轮文本：确认本轮没有工具调用后才推给前端，
+                        # 避免工具调用轮把内部 DSML 泄漏到回答。
+                        round_text.append(event.text)
                     elif event.kind == "tool_call" and event.tool_call is not None:
                         tool_calls.append(event.tool_call)
 
                 if not tool_calls:
+                    # 自然语言轮：本轮的文本才是最终回答，此时才流式推送。
+                    for chunk in round_text:
+                        buffer.append(chunk)
+                        yield _sse({"type": "delta", "text": chunk})
                     break
 
                 # 推理型模型的思考内容必须随工具调用回传，否则上游返回 400。
@@ -481,18 +489,35 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                     )
 
                 if not assistant_tool_calls:
+                    # 只出现未知工具：把本轮回退为自然语言轮。
+                    for chunk in round_text:
+                        buffer.append(chunk)
+                        yield _sse({"type": "delta", "text": chunk})
                     break
 
-                # 追加助手工具调用（含思考内容）与全部工具结果，进入第二轮生成最终回答。
+                # 追加助手工具调用（含思考内容）与全部工具结果，继续下一轮。
+                # 工具调用轮的文本进入 assistant 消息上下文，不进入最终回答。
                 assistant_msg: dict = {
                     "role": "assistant",
-                    "content": "",
+                    "content": strip_text_tool_calls("".join(round_text)),
                     "tool_calls": assistant_tool_calls,
                 }
                 if reasoning_content:
                     assistant_msg["reasoning_content"] = reasoning_content
                 turns = [*turns, assistant_msg, *tool_results]
-                tools = None  # 第二轮不再给工具，避免死循环
+                # 关键：不设 tools=None，保留工具定义让模型可连续多轮调用；
+                # 由 MAX_TOOL_ROUNDS 上限兜底，杜绝死循环。
+            else:
+                # 达到轮次上限仍未输出自然语言：用无工具轮强制收敛，避免空回答。
+                async for event in llm.stream_round(
+                    messages=turns,
+                    request_id=request_id,
+                    tools=None,
+                    rag_chunks=rag_chunks,
+                ):
+                    if event.kind == "delta":
+                        buffer.append(event.text)
+                        yield _sse({"type": "delta", "text": event.text})
 
             reply = strip_text_tool_calls("".join(buffer))
             # 组装本轮实际采用的来源，随助手消息落库以便刷新后恢复展示。

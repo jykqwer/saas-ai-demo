@@ -19,6 +19,7 @@ def client(tmp_path):
         app_name="Test SaaS AI Assistant API",
         environment="test",
         log_level="CRITICAL",
+        auth_enabled=False,
         llm_api_key=None,
         rag_enabled=True,
         rag_knowledge_base_dir=str(kb_dir),
@@ -42,7 +43,10 @@ def test_read_doc(client: TestClient) -> None:
 def test_import_doc_usable_in_chat(client: TestClient) -> None:
     response = client.post(
         "/api/v1/knowledge/docs",
-        json={"filename": "faq.md", "content": "# FAQ\n\n## 忘记密码\n可点击忘记密码自助重置，15 分钟解锁。"},
+        json={
+            "filename": "faq.md",
+            "content": "# FAQ\n\n## 忘记密码\n可点击忘记密码自助重置，15 分钟解锁。",
+        },
     )
     assert response.status_code == 201
     assert response.json()["doc"]["name"] == "faq.md"
@@ -51,14 +55,19 @@ def test_import_doc_usable_in_chat(client: TestClient) -> None:
     names = [d["name"] for d in client.get("/api/v1/knowledge/docs").json()["docs"]]
     assert "faq.md" in names
 
-    reply = client.post("/api/v1/chat", json={"content": "忘记密码怎么处理"}).json()["reply"]
+    reply = client.post("/api/v1/chat", json={"content": "忘记密码怎么处理"}).json()[
+        "reply"
+    ]
     assert "自助重置" in reply
 
 
 def test_import_overwrites_existing(client: TestClient) -> None:
     client.post(
         "/api/v1/knowledge/docs",
-        json={"filename": "sample.md", "content": "# 覆盖后的文档\n\n## 新内容\n新版说明。"},
+        json={
+            "filename": "sample.md",
+            "content": "# 覆盖后的文档\n\n## 新内容\n新版说明。",
+        },
     )
     body = client.get("/api/v1/knowledge/docs").json()
     assert len(body["docs"]) == 1
@@ -95,6 +104,7 @@ def test_knowledge_disabled_returns_empty(client: TestClient) -> None:
     settings = Settings(
         environment="test",
         log_level="CRITICAL",
+        auth_enabled=False,
         llm_api_key=None,
         rag_enabled=False,
     )
@@ -103,10 +113,13 @@ def test_knowledge_disabled_returns_empty(client: TestClient) -> None:
         body = c.get("/api/v1/knowledge/docs").json()
         assert body["docs"] == []
         assert body["total_chunks"] == 0
-        assert c.post(
-            "/api/v1/knowledge/docs",
-            json={"filename": "x.md", "content": "# x"},
-        ).status_code == 409
+        assert (
+            c.post(
+                "/api/v1/knowledge/docs",
+                json={"filename": "x.md", "content": "# x"},
+            ).status_code
+            == 409
+        )
 
 
 def test_retrieve_across_all_docs(client: TestClient) -> None:

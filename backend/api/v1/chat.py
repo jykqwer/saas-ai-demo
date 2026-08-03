@@ -8,6 +8,7 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from core.auth import AuthenticatedUser, consume_question_quota
 from core.errors import ApiError
 from core.llm import ChatProviderError, LLMToolCall, strip_text_tool_calls
 from domain.chat import (
@@ -160,13 +161,20 @@ def _build_system_prompt(
     return prompt
 
 
-async def _resolve_session(request: Request, session_id: UUID | None, content: str):
+async def _resolve_session(
+    request: Request,
+    session_id: UUID | None,
+    content: str,
+    owner_user_id: UUID,
+):
     """解析会话；没有提供 ID 时创建新会话（标题取自首条消息）。"""
 
     repo = _repository(request)
     if session_id is None:
-        return await repo.create_session(title=default_title(content))
-    session = await repo.get_session(session_id=session_id)
+        return await repo.create_session(
+            title=default_title(content), owner_user_id=owner_user_id
+        )
+    session = await repo.get_session(session_id=session_id, owner_user_id=owner_user_id)
     if session is None:
         raise ApiError(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -195,9 +203,7 @@ async def _build_turns(
     history = await repo.list_messages(session_id=session_id)
 
     rag = _rag_engine(request)
-    rag_chunks = (
-        rag.retrieve(content) if (rag is not None and pre_inject_rag) else []
-    )
+    rag_chunks = rag.retrieve(content) if (rag is not None and pre_inject_rag) else []
     system_prompt = _build_system_prompt(request, content, chunks=rag_chunks)
 
     turns: list[dict] = [{"role": "system", "content": system_prompt}]
@@ -238,12 +244,17 @@ async def _persist(
     status_code=status.HTTP_200_OK,
     summary="Send a chat turn to the assistant",
 )
-async def chat(request: Request, body: ChatRequest) -> ChatResponse:
+async def chat(
+    request: Request,
+    body: ChatRequest,
+    user: AuthenticatedUser,
+) -> ChatResponse:
     """非流式对话：持久化消息并返回助手完整回复。"""
 
     llm = request.app.state.llm_client
     request_id = getattr(request.state, "request_id", "unknown")
-    session = await _resolve_session(request, body.session_id, body.content)
+    await consume_question_quota(request, user)
+    session = await _resolve_session(request, body.session_id, body.content, user.id)
     await _persist(request, session_id=session.id, role="user", content=body.content)
 
     turns, rag_chunks = await _build_turns(request, session.id, body.content)
@@ -269,7 +280,11 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
         sources=(
             {
                 "rag": [
-                    {"source": c.source, "heading": c.heading, "score": round(c.score, 3)}
+                    {
+                        "source": c.source,
+                        "heading": c.heading,
+                        "score": round(c.score, 3),
+                    }
                     for c in rag_chunks
                 ]
             }
@@ -293,15 +308,22 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     status_code=status.HTTP_200_OK,
     summary="Stream a chat turn from the assistant (SSE)",
 )
-async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
+async def chat_stream(
+    request: Request,
+    body: ChatRequest,
+    user: AuthenticatedUser,
+) -> StreamingResponse:
     """SSE 流式对话：逐段推送助手回复增量，结束时落库。"""
 
     llm = request.app.state.llm_client
     request_id = getattr(request.state, "request_id", "unknown")
+    quota = await consume_question_quota(request, user)
 
     async def event_source():
         try:
-            session = await _resolve_session(request, body.session_id, body.content)
+            session = await _resolve_session(
+                request, body.session_id, body.content, user.id
+            )
             await _persist(
                 request, session_id=session.id, role="user", content=body.content
             )
@@ -353,6 +375,7 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                         }
                         for chunk in rag_chunks
                     ],
+                    "quota": quota.model_dump(mode="json"),
                 }
             )
 
@@ -478,9 +501,7 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                     elif tool_call.name == "retrieve_knowledge_base":
                         # 知识库按需检索：只有模型判定为产品问题时才执行并展示来源。
                         chunks = (
-                            rag.retrieve(query)
-                            if rag is not None and query
-                            else []
+                            rag.retrieve(query) if rag is not None and query else []
                         )
                         current_rag_meta = [
                             {
@@ -583,6 +604,7 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                     "web": tool_used or mode == "web",
                     "web_count": web_count,
                     "rag_count": rag_count,
+                    "quota": quota.model_dump(mode="json"),
                 }
             )
         except ChatProviderError as exc:
@@ -622,15 +644,21 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
     status_code=status.HTTP_201_CREATED,
     summary="Create a human-handoff ticket",
 )
-async def handoff(request: Request, body: HandoffRequest) -> HandoffResponse:
+async def handoff(
+    request: Request,
+    body: HandoffRequest,
+    user: AuthenticatedUser,
+) -> HandoffResponse:
     """创建人工转接工单；未提供会话时自动开一个。"""
 
     repo = _repository(request)
     if body.session_id is None:
-        session = await repo.create_session(title="人工转接咨询")
+        session = await repo.create_session(title="人工转接咨询", owner_user_id=user.id)
         session_id = session.id
     else:
-        session = await repo.get_session(session_id=body.session_id)
+        session = await repo.get_session(
+            session_id=body.session_id, owner_user_id=user.id
+        )
         if session is None:
             raise ApiError(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -681,7 +709,6 @@ async def chat_config(request: Request) -> ChatConfigResponse:
         rag_docs=rag.document_count if rag else 0,
         rag_chunks=rag.chunk_count if rag else 0,
         quick_questions=[
-            {"label": q.label, "question": q.question}
-            for q in profile.quick_questions
+            {"label": q.label, "question": q.question} for q in profile.quick_questions
         ],
     )

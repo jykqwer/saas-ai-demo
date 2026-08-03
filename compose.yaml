@@ -1,3 +1,5 @@
+name: saas-ai-demo
+
 services:
   backend:
     build: ./backend
@@ -19,6 +21,13 @@ services:
       WEB_SEARCH_PROVIDER: ${WEB_SEARCH_PROVIDER:-tavily}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       WEB_SEARCH_MAX_RESULTS: ${WEB_SEARCH_MAX_RESULTS:-5}
+      # 演示用户服务：默认管理员仅用于本地 demo，生产必须通过 Secret 覆盖。
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      USER_DAILY_QUESTION_LIMIT: ${USER_DAILY_QUESTION_LIMIT:-10}
+      QUOTA_TIMEZONE: ${QUOTA_TIMEZONE:-Asia/Shanghai}
+      AUTH_SESSION_TTL_HOURS: ${AUTH_SESSION_TTL_HOURS:-24}
+      BOOTSTRAP_SUPERUSER_USERNAME: ${BOOTSTRAP_SUPERUSER_USERNAME:-demo-admin}
+      BOOTSTRAP_SUPERUSER_PASSWORD: ${BOOTSTRAP_SUPERUSER_PASSWORD:-DemoAdmin123!}
       # 会话持久化：必须使用 postgresql+psycopg scheme。
       DATABASE_URL: postgresql+psycopg://saasuser:dev-password@postgres:5432/saasdb
       # 源码目录绑定到宿主机时不生成容器用户所属的 pycache，避免本地检查遇到权限冲突。

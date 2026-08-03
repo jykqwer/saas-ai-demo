@@ -43,7 +43,7 @@ function HighlightContent({ text, query }) {
 }
 
 
-export default function KnowledgeModal({ open, initialDoc, onClose, onChanged }) {
+export default function KnowledgeModal({ open, initialDoc, readOnly = false, onClose, onChanged }) {
   const [docs, setDocs] = useState([])
   // 初始即“加载中”；所有 setState 都发生在异步回调里，避免触发 set-state-in-effect。
   const [loading, setLoading] = useState(true)
@@ -200,7 +200,7 @@ export default function KnowledgeModal({ open, initialDoc, onClose, onChanged })
         onClick={(e) => e.stopPropagation()}
       >
         <div className="modal-head">
-          <h3>📚 知识库管理</h3>
+          <h3>📚 {readOnly ? '知识库查看' : '知识库管理'}</h3>
           <button type="button" className="modal-close" aria-label="关闭" onClick={onClose}>
             ✕
           </button>
@@ -301,11 +301,13 @@ export default function KnowledgeModal({ open, initialDoc, onClose, onChanged })
         ) : (
           <>
             <p className="modal-desc">
-              查看或导入 RAG 检索所用的 Markdown 文档。导入后立即生效。
+              {readOnly
+                ? '查看 RAG 检索所使用的 Markdown 文档。'
+                : '查看或导入 RAG 检索所用的 Markdown 文档。导入后立即生效。'}
             </p>
 
             {/* 导入区 */}
-            <div className="kb-import">
+            {!readOnly && <div className="kb-import">
               <div className="kb-import-row">
                 <input
                   className="kb-filename"
@@ -345,7 +347,7 @@ export default function KnowledgeModal({ open, initialDoc, onClose, onChanged })
                   {importing ? '导入中…' : '⬆️ 导入文档'}
                 </button>
               </div>
-            </div>
+            </div>}
 
             {notice && <div className="success-banner kb-notice">✅ {notice}</div>}
             {error && <div className="form-error kb-error">⚠️ {error}</div>}
@@ -369,9 +371,11 @@ export default function KnowledgeModal({ open, initialDoc, onClose, onChanged })
                     <button type="button" className="btn btn-ghost btn-sm" onClick={() => openDoc(doc.name)}>
                       查看
                     </button>
-                    <button type="button" className="btn btn-danger btn-sm" onClick={() => removeDoc(doc.name)}>
-                      删除
-                    </button>
+                    {!readOnly && (
+                      <button type="button" className="btn btn-danger btn-sm" onClick={() => removeDoc(doc.name)}>
+                        删除
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}

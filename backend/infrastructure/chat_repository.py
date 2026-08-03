@@ -56,17 +56,26 @@ class SqlAlchemyChatRepository:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def create_session(self, *, title: str) -> ChatSession:
+    async def create_session(self, *, title: str, owner_user_id: UUID) -> ChatSession:
         async with self._session_factory() as session:
-            row = ChatSessionRow(title=title)
+            row = ChatSessionRow(title=title, owner_user_id=owner_user_id)
             session.add(row)
             await session.commit()
             await session.refresh(row)
             return _to_session(row, 0)
 
-    async def get_session(self, *, session_id: UUID) -> ChatSession | None:
+    async def get_session(
+        self, *, session_id: UUID, owner_user_id: UUID
+    ) -> ChatSession | None:
         async with self._session_factory() as session:
-            row = await session.get(ChatSessionRow, session_id)
+            row = (
+                await session.execute(
+                    select(ChatSessionRow).where(
+                        ChatSessionRow.id == session_id,
+                        ChatSessionRow.owner_user_id == owner_user_id,
+                    )
+                )
+            ).scalar_one_or_none()
             if row is None:
                 return None
             count = (
@@ -78,15 +87,22 @@ class SqlAlchemyChatRepository:
             ).scalar_one()
             return _to_session(row, int(count))
 
-    async def list_sessions(self, *, limit: int = 50) -> list[ChatSession]:
+    async def list_sessions(
+        self, *, owner_user_id: UUID, limit: int = 50
+    ) -> list[ChatSession]:
         async with self._session_factory() as session:
             rows = (
-                await session.execute(
-                    select(ChatSessionRow).order_by(
-                        ChatSessionRow.updated_at.desc()
-                    ).limit(limit)
+                (
+                    await session.execute(
+                        select(ChatSessionRow)
+                        .where(ChatSessionRow.owner_user_id == owner_user_id)
+                        .order_by(ChatSessionRow.updated_at.desc())
+                        .limit(limit)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             counts = dict(
                 (
                     await session.execute(
@@ -97,14 +113,15 @@ class SqlAlchemyChatRepository:
                     )
                 ).all()
             )
-            return [
-                _to_session(row, int(counts.get(row.id, 0))) for row in rows
-            ]
+            return [_to_session(row, int(counts.get(row.id, 0))) for row in rows]
 
-    async def delete_session(self, *, session_id: UUID) -> bool:
+    async def delete_session(self, *, session_id: UUID, owner_user_id: UUID) -> bool:
         async with self._session_factory() as session:
             result = await session.execute(
-                delete(ChatSessionRow).where(ChatSessionRow.id == session_id)
+                delete(ChatSessionRow).where(
+                    ChatSessionRow.id == session_id,
+                    ChatSessionRow.owner_user_id == owner_user_id,
+                )
             )
             await session.commit()
             return result.rowcount > 0
@@ -140,13 +157,17 @@ class SqlAlchemyChatRepository:
     ) -> list[StoredMessage]:
         async with self._session_factory() as session:
             rows = (
-                await session.execute(
-                    select(ChatMessageRow)
-                    .where(ChatMessageRow.session_id == session_id)
-                    .order_by(ChatMessageRow.created_at.asc())
-                    .limit(limit)
+                (
+                    await session.execute(
+                        select(ChatMessageRow)
+                        .where(ChatMessageRow.session_id == session_id)
+                        .order_by(ChatMessageRow.created_at.asc())
+                        .limit(limit)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             return [_to_message(row) for row in rows]
 
     async def touch_session(self, *, session_id: UUID) -> None:
@@ -190,12 +211,16 @@ class SqlAlchemyChatRepository:
     async def list_tickets(self, *, session_id: UUID) -> list[HandoffTicket]:
         async with self._session_factory() as session:
             rows = (
-                await session.execute(
-                    select(HandoffTicketRow)
-                    .where(HandoffTicketRow.session_id == session_id)
-                    .order_by(HandoffTicketRow.created_at.desc())
+                (
+                    await session.execute(
+                        select(HandoffTicketRow)
+                        .where(HandoffTicketRow.session_id == session_id)
+                        .order_by(HandoffTicketRow.created_at.desc())
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             return [
                 HandoffTicket(
                     id=row.id,
@@ -223,7 +248,7 @@ class EphemeralChatRepository:
         self._messages: dict[UUID, list[StoredMessage]] = defaultdict(list)
         self._tickets: dict[UUID, list[HandoffTicket]] = defaultdict(list)
 
-    async def create_session(self, *, title: str) -> ChatSession:
+    async def create_session(self, *, title: str, owner_user_id: UUID) -> ChatSession:
         now = utcnow()
         session_id = uuid4()
         async with self._lock:
@@ -232,6 +257,7 @@ class EphemeralChatRepository:
                 "title": title,
                 "created_at": now,
                 "updated_at": now,
+                "owner_user_id": owner_user_id,
             }
         return ChatSession(
             id=session_id,
@@ -241,9 +267,11 @@ class EphemeralChatRepository:
             message_count=0,
         )
 
-    async def get_session(self, *, session_id: UUID) -> ChatSession | None:
+    async def get_session(
+        self, *, session_id: UUID, owner_user_id: UUID
+    ) -> ChatSession | None:
         data = self._sessions.get(session_id)
-        if data is None:
+        if data is None or data["owner_user_id"] != owner_user_id:
             return None
         return ChatSession(
             id=data["id"],
@@ -253,9 +281,15 @@ class EphemeralChatRepository:
             message_count=len(self._messages[session_id]),
         )
 
-    async def list_sessions(self, *, limit: int = 50) -> list[ChatSession]:
+    async def list_sessions(
+        self, *, owner_user_id: UUID, limit: int = 50
+    ) -> list[ChatSession]:
         sessions = sorted(
-            self._sessions.values(),
+            (
+                session
+                for session in self._sessions.values()
+                if session["owner_user_id"] == owner_user_id
+            ),
             key=lambda s: s["updated_at"],
             reverse=True,
         )[:limit]
@@ -270,8 +304,11 @@ class EphemeralChatRepository:
             for s in sessions
         ]
 
-    async def delete_session(self, *, session_id: UUID) -> bool:
+    async def delete_session(self, *, session_id: UUID, owner_user_id: UUID) -> bool:
         async with self._lock:
+            data = self._sessions.get(session_id)
+            if data is None or data["owner_user_id"] != owner_user_id:
+                return False
             existed = self._sessions.pop(session_id, None) is not None
             self._messages.pop(session_id, None)
             self._tickets.pop(session_id, None)

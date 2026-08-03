@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-APP_LOGGER_NAME = "saas-ai"
+APP_LOGGER_NAME = "saas-ai-demo"
 _STRUCTURED_FIELDS = (
     "request_id",
     "method",

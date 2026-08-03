@@ -18,6 +18,7 @@ def app_settings() -> Settings:
         app_name="Test SaaS AI Assistant API",
         environment="test",
         log_level="CRITICAL",
+        auth_enabled=False,
         llm_api_key=None,
         llm_base_url="https://api.deepseek.com",
         llm_model="deepseek-chat",
@@ -87,9 +88,7 @@ def test_chat_persists_messages(client: TestClient) -> None:
 def test_chat_multi_turn_keeps_context(client: TestClient) -> None:
     """同一会话内多轮对话应保留上下文并持续追加消息。"""
 
-    first = client.post(
-        "/api/v1/chat", json={"content": "你们的价格是多少？"}
-    ).json()
+    first = client.post("/api/v1/chat", json={"content": "你们的价格是多少？"}).json()
     session_id = first["session_id"]
 
     second = client.post(
@@ -187,6 +186,7 @@ def test_auto_mode_tools_disabled_web_keeps_rag() -> None:
         app_name="Test SaaS AI Assistant API",
         environment="test",
         log_level="CRITICAL",
+        auth_enabled=False,
         llm_api_key="sk-test",
         llm_base_url="https://api.deepseek.com",
         llm_model="deepseek-chat",
@@ -232,6 +232,7 @@ def test_tool_loop_echoes_reasoning_content() -> None:
         app_name="Test SaaS AI Assistant API",
         environment="test",
         log_level="CRITICAL",
+        auth_enabled=False,
         llm_api_key="sk-test",
         llm_base_url="https://api.deepseek.com",
         llm_model="deepseek-chat",
@@ -308,6 +309,7 @@ def test_tool_loop_keeps_tools_across_rounds() -> None:
         app_name="Test SaaS AI Assistant API",
         environment="test",
         log_level="CRITICAL",
+        auth_enabled=False,
         llm_api_key="sk-test",
         llm_base_url="https://api.deepseek.com",
         llm_model="deepseek-chat",
@@ -374,9 +376,9 @@ def test_tool_loop_keeps_tools_across_rounds() -> None:
 
 
 def test_handoff_creates_ticket(client: TestClient) -> None:
-    session_id = client.post(
-        "/api/v1/chat", json={"content": "我想转人工"}
-    ).json()["session_id"]
+    session_id = client.post("/api/v1/chat", json={"content": "我想转人工"}).json()[
+        "session_id"
+    ]
 
     response = client.post(
         "/api/v1/chat/handoff",
@@ -420,9 +422,9 @@ def test_sessions_listing(client: TestClient) -> None:
 
 
 def test_delete_session(client: TestClient) -> None:
-    session_id = client.post(
-        "/api/v1/chat", json={"content": "待删除"}
-    ).json()["session_id"]
+    session_id = client.post("/api/v1/chat", json={"content": "待删除"}).json()[
+        "session_id"
+    ]
 
     response = client.delete(f"/api/v1/sessions/{session_id}")
     assert response.status_code == 200

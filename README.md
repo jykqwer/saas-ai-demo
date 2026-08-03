@@ -1,4 +1,4 @@
-# 小枢 · SaaS AI 客服/售前助手
+# saas-ai-demo · 小枢 AI 客服/售前助手
 
 面向 SaaS 企业的 **AI 对话助手**：访客可直接向助手咨询产品、价格、试用、私有化部署、
 数据安全与售后问题。未配置大模型 Key 时自动进入**演示模式**（内置产品知识库关键词回复），
@@ -99,6 +99,12 @@ npm run build
 | `SAAS_COMPANY_NAME` | `云枢科技` | 公司名 |
 | `DATABASE_URL` | 空（内存仓库） | 会话持久化连接串，必须 `postgresql+psycopg://` |
 | `DATABASE_HEALTH_TIMEOUT_SECONDS` | `2.0` | readiness 数据库探测最长等待 |
+| `AUTH_ENABLED` | `true` | 是否启用登录、审批和用户隔离 |
+| `USER_DAILY_QUESTION_LIMIT` | `10` | 普通用户每天可提交的问答次数 |
+| `QUOTA_TIMEZONE` | `Asia/Shanghai` | 每日额度重置所使用的 IANA 时区 |
+| `AUTH_SESSION_TTL_HOURS` | `24` | 登录会话有效小时数 |
+| `BOOTSTRAP_SUPERUSER_USERNAME` | 空 | 启动时引导创建的 superuser 用户名 |
+| `BOOTSTRAP_SUPERUSER_PASSWORD` | 空 | 引导 superuser 密码，至少 8 位，仅通过 Secret 注入 |
 | `RAG_ENABLED` | `true` | 是否启用知识库检索增强 |
 | `RAG_TOP_K` | `3` | 每次检索注入的分块数 |
 | `RAG_MIN_SCORE` | `1.0` | 全局检索的最低相关度阈值，过滤明显无关片段；显式按文档过滤时不生效 |
@@ -115,12 +121,20 @@ npm run build
 让大模型基于真实资料回答（演示模式同样走检索）。切换服务商或换模型只需改 `.env`。
 
 **数据库说明**：未配置 `DATABASE_URL` 时使用内存仓库（本地联调、测试）；
-配置后使用 PostgreSQL 持久化（compose 与 k3s 均已内置）。启动后不会自动建表，
-需先执行迁移：
+配置后使用 PostgreSQL 持久化（compose 与 k3s 均已内置）。Compose 会在后端启动前
+自动执行迁移，也可手工执行：
 
 ```bash
 docker compose exec backend alembic -c alembic.ini upgrade head
 ```
+
+## 演示用户服务
+
+- 未登录用户不能发送问题或访问会话。
+- 新注册账号状态为 `pending`，需 superuser 在侧边栏「用户审批」中通过后才能登录。
+- `user` 每个自然日最多问答 10 次，配额按 `QUOTA_TIMEZONE` 重置；并发请求通过数据库原子计数。
+- `superuser` 问答不限次数，并可审批用户及维护知识库。
+- Compose 本地演示默认账号为 `demo-admin` / `DemoAdmin123!`；生产环境必须覆盖默认密码。
 
 切换到 OpenAI：`LLM_BASE_URL=https://api.openai.com/v1`、`LLM_MODEL=gpt-4o-mini`。
 
@@ -133,6 +147,13 @@ docker compose exec backend alembic -c alembic.ini upgrade head
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
+| POST | `/api/v1/auth/register` | 注册普通用户（初始为待审批） |
+| POST | `/api/v1/auth/login` | 登录并获取 Bearer Token |
+| GET | `/api/v1/auth/me` | 当前用户、角色与今日配额 |
+| POST | `/api/v1/auth/logout` | 注销当前 Token |
+| GET | `/api/v1/admin/users` | 用户列表（仅 superuser） |
+| POST | `/api/v1/admin/users/{id}/approve` | 通过注册申请（仅 superuser） |
+| POST | `/api/v1/admin/users/{id}/reject` | 拒绝注册申请（仅 superuser） |
 | POST | `/api/v1/chat` | 非流式对话（`content` + 可选 `session_id`） |
 | POST | `/api/v1/chat/stream` | SSE 流式对话（`meta` / `delta` / `done` / `error` 事件） |
 | POST | `/api/v1/chat/handoff` | 创建人工转接工单 |

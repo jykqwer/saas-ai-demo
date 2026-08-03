@@ -3,14 +3,14 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: backend-migration-0001
-  namespace: saas-ai
+  namespace: saas-ai-demo
 spec:
   template:
     spec:
       restartPolicy: Never
       containers:
         - name: migrate
-          image: docker.io/jykqwer/saas-ai-backend:latest
+          image: docker.io/jykqwer/saas-ai-demo-backend:latest
           imagePullPolicy: IfNotPresent
           command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
           env:

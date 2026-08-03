@@ -2,25 +2,25 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: backend
-  namespace: saas-ai
+  namespace: saas-ai-demo
   labels:
-    app: saas-ai
+    app: saas-ai-demo
     component: backend
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: saas-ai
+      app: saas-ai-demo
       component: backend
   template:
     metadata:
       labels:
-        app: saas-ai
+        app: saas-ai-demo
         component: backend
     spec:
       containers:
         - name: backend
-          image: docker.io/jykqwer/saas-ai-backend:latest
+          image: docker.io/jykqwer/saas-ai-demo-backend:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
@@ -49,6 +49,20 @@ spec:
                   name: llm-credentials
                   key: TAVILY_API_KEY
                   optional: true
+            # 用户注册审批与每日配额。
+            - name: AUTH_ENABLED
+              value: "true"
+            - name: USER_DAILY_QUESTION_LIMIT
+              value: "10"
+            - name: QUOTA_TIMEZONE
+              value: "Asia/Shanghai"
+            - name: BOOTSTRAP_SUPERUSER_USERNAME
+              value: "demo-admin"
+            - name: BOOTSTRAP_SUPERUSER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: llm-credentials
+                  key: BOOTSTRAP_SUPERUSER_PASSWORD
             # 从 Secret 注入 LLM 凭据；未配置 Key 时后端进入演示模式。
             - name: LLM_API_KEY
               valueFrom:

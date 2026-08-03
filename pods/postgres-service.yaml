@@ -2,10 +2,10 @@ apiVersion: v1
 kind: Service
 metadata:
   name: postgres-service
-  namespace: saas-ai
+  namespace: saas-ai-demo
 spec:
   selector:
-    app: saas-ai
+    app: saas-ai-demo
     component: postgres
   ports:
     - name: postgres

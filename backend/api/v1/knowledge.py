@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from core.auth import AuthenticatedUser, Superuser
 from core.errors import ApiError
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
@@ -105,7 +106,8 @@ def _kb(request: Request):
     status_code=status.HTTP_200_OK,
     summary="List knowledge base documents",
 )
-async def list_docs(request: Request) -> DocumentListResponse:
+async def list_docs(request: Request, user: AuthenticatedUser) -> DocumentListResponse:
+    del user
     kb = getattr(request.app.state, "rag", None)
     if kb is None:
         return DocumentListResponse(docs=[], total_chunks=0)
@@ -131,7 +133,12 @@ async def list_docs(request: Request) -> DocumentListResponse:
     status_code=status.HTTP_200_OK,
     summary="Read a knowledge base document",
 )
-async def read_doc(request: Request, name: str) -> DocumentContentResponse:
+async def read_doc(
+    request: Request,
+    name: str,
+    user: AuthenticatedUser,
+) -> DocumentContentResponse:
+    del user
     kb = _kb(request)
     content = kb.read_document(name)
     if content is None:
@@ -149,7 +156,12 @@ async def read_doc(request: Request, name: str) -> DocumentContentResponse:
     status_code=status.HTTP_201_CREATED,
     summary="Import a knowledge base document",
 )
-async def import_doc(request: Request, body: DocumentImportRequest) -> DocumentImportResponse:
+async def import_doc(
+    request: Request,
+    body: DocumentImportRequest,
+    superuser: Superuser,
+) -> DocumentImportResponse:
+    del superuser
     kb = _kb(request)
     if len(body.content.encode("utf-8")) > MAX_DOCUMENT_BYTES:
         raise ApiError(
@@ -183,7 +195,12 @@ async def import_doc(request: Request, body: DocumentImportRequest) -> DocumentI
     status_code=status.HTTP_200_OK,
     summary="Delete a knowledge base document",
 )
-async def delete_doc(request: Request, name: str) -> DeleteResponse:
+async def delete_doc(
+    request: Request,
+    name: str,
+    superuser: Superuser,
+) -> DeleteResponse:
+    del superuser
     kb = _kb(request)
     deleted = kb.delete_document(name)
     return DeleteResponse(deleted=deleted)
@@ -195,9 +212,14 @@ async def delete_doc(request: Request, name: str) -> DeleteResponse:
     status_code=status.HTTP_200_OK,
     summary="Test retrieval against the knowledge base",
 )
-async def retrieve_docs(request: Request, body: RetrieveRequest) -> RetrieveResponse:
+async def retrieve_docs(
+    request: Request,
+    body: RetrieveRequest,
+    user: AuthenticatedUser,
+) -> RetrieveResponse:
     """检索测试：不调用大模型，直接返回命中的知识库分块，便于调试 RAG。"""
 
+    del user
     kb = _kb(request)
     results = kb.retrieve(body.query, k=body.k, doc=body.doc)
     return RetrieveResponse(

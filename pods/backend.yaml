@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: saas-ai
+  labels:
+    app: saas-ai
+    component: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: saas-ai
+      component: backend
+  template:
+    metadata:
+      labels:
+        app: saas-ai
+        component: backend
+    spec:
+      containers:
+        - name: backend
+          image: docker.io/jykqwer/saas-ai-backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: APP_ENV
+              value: "production"
+            - name: CORS_ALLOW_ORIGINS
+              value: "https://chat.example.com"
+            - name: SAAS_PRODUCT_NAME
+              value: "云枢 CloudHub"
+            - name: SAAS_COMPANY_NAME
+              value: "云枢科技"
+            # RAG 知识库（镜像内置 backend/knowledge_base/*.md）
+            - name: RAG_ENABLED
+              value: "true"
+            - name: RAG_TOP_K
+              value: "3"
+            # 网络搜索
+            - name: WEB_SEARCH_ENABLED
+              value: "true"
+            - name: WEB_SEARCH_PROVIDER
+              value: "duckduckgo"
+            # 从 Secret 注入 LLM 凭据；未配置 Key 时后端进入演示模式。
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-credentials
+                  key: LLM_API_KEY
+            - name: LLM_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: llm-credentials
+                  key: LLM_BASE_URL
+            - name: LLM_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: llm-credentials
+                  key: LLM_MODEL
+            # 会话持久化连接串来自数据库凭据 Secret。
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health/ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health/live
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

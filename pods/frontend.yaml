@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: saas-ai
+  labels:
+    app: saas-ai
+    component: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: saas-ai
+      component: frontend
+  template:
+    metadata:
+      labels:
+        app: saas-ai
+        component: frontend
+    spec:
+      containers:
+        - name: frontend
+          # 生产镜像：nginx 托管静态资源并反向代理 /api 到 backend-service。
+          image: docker.io/jykqwer/saas-ai-frontend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

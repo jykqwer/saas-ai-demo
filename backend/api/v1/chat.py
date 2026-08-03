@@ -1,0 +1,524 @@
+"""AI 客服/售前助手的聊天接口、流式输出与人工转接接口。"""
+
+import json
+from typing import Literal
+from uuid import UUID
+
+from fastapi import APIRouter, Request, status
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from core.errors import ApiError
+from core.llm import ChatProviderError
+from domain.chat import (
+    MAX_MESSAGE_CHARS,
+    WEB_SEARCH_TOOL,
+    AssistantProfile,
+    build_assistant_profile,
+    build_system_prompt,
+    format_rag_context,
+    format_web_context,
+    format_web_results,
+)
+from domain.session import (
+    MAX_CONTACT_VALUE_CHARS,
+    MAX_TICKET_SUBJECT_CHARS,
+    default_title,
+)
+
+router = APIRouter(prefix="/chat", tags=["chat"])
+
+
+def _sse(payload: dict) -> str:
+    """把事件对象编码为 SSE data 帧。"""
+
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+class ChatRequest(BaseModel):
+    """单轮聊天请求：只携带本条用户消息，历史由服务端从仓库加载。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+    session_id: UUID | None = None
+    # auto=智能（模型按需联网）；web=始终联网；knowledge=仅知识库
+    mode: Literal["auto", "web", "knowledge"] = "auto"
+
+    @field_validator("content")
+    @classmethod
+    def normalize_content(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("content must contain non-whitespace characters")
+        return normalized
+
+
+class ChatResponse(BaseModel):
+    """非流式响应；携带会话 ID 与展示信息。"""
+
+    reply: str
+    session_id: UUID
+    model: str
+    provider: str
+    mock: bool
+    latency_ms: int
+
+
+class HandoffRequest(BaseModel):
+    """人工转接工单请求。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: UUID | None = None
+    contact_name: str = Field(min_length=1, max_length=60)
+    contact_type: Literal["email", "wechat", "phone"]
+    contact_value: str = Field(min_length=1, max_length=MAX_CONTACT_VALUE_CHARS)
+    subject: str = Field(default="", max_length=MAX_TICKET_SUBJECT_CHARS)
+
+    @field_validator("contact_name", "contact_value")
+    @classmethod
+    def normalize_required(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("must contain non-whitespace characters")
+        return normalized
+
+    @field_validator("subject")
+    @classmethod
+    def normalize_subject(cls, value: str) -> str:
+        return value.strip()
+
+
+class HandoffResponse(BaseModel):
+    """转人工成功响应。"""
+
+    ticket_id: UUID
+    session_id: UUID
+    message: str
+
+
+class ChatConfigResponse(BaseModel):
+    """前端引导配置：问候语、快捷问题、接入状态。"""
+
+    product_name: str
+    company_name: str
+    assistant_name: str
+    greeting: str
+    configured: bool
+    provider: str
+    model: str
+    rag_docs: int = 0
+    rag_chunks: int = 0
+    quick_questions: list[dict[str, str]]
+
+
+def _repository(request: Request):
+    return request.app.state.chat_repository
+
+
+def _rag_engine(request: Request):
+    return getattr(request.app.state, "rag", None)
+
+
+def _build_system_prompt(request: Request, content: str) -> str:
+    settings = request.app.state.settings
+    prompt = build_system_prompt(
+        product_name=settings.saas_product_name,
+        company_name=settings.saas_company_name,
+    )
+    # 检索知识库并追加参考资料；无命中则保持原提示词。
+    rag = _rag_engine(request)
+    if rag is not None:
+        chunks = rag.retrieve(content)
+        prompt += format_rag_context(chunks)
+    return prompt
+
+
+def _retrieve_chunks(request: Request, content: str) -> list:
+    rag = _rag_engine(request)
+    if rag is None:
+        return []
+    return rag.retrieve(content)
+
+
+async def _resolve_session(request: Request, session_id: UUID | None, content: str):
+    """解析会话；没有提供 ID 时创建新会话（标题取自首条消息）。"""
+
+    repo = _repository(request)
+    if session_id is None:
+        return await repo.create_session(title=default_title(content))
+    session = await repo.get_session(session_id=session_id)
+    if session is None:
+        raise ApiError(
+            status_code=status.HTTP_404_NOT_FOUND,
+            code="SESSION_NOT_FOUND",
+            message="The conversation session does not exist.",
+        )
+    return session
+
+
+async def _build_turns(
+    request: Request, session_id: UUID, content: str
+) -> tuple[list[dict], list]:
+    """加载最近上下文并追加当前用户消息，构造带系统提示词与 RAG 上下文的输入。"""
+
+    settings = request.app.state.settings
+    repo = _repository(request)
+    history = await repo.list_messages(session_id=session_id)
+
+    rag_chunks = _retrieve_chunks(request, content)
+    system_prompt = _build_system_prompt(request, content)
+
+    turns: list[dict] = [{"role": "system", "content": system_prompt}]
+    # 保留最近 N 轮（2N 条消息），避免请求体无界增长。
+    for message in history[-settings.llm_max_context_turns * 2 :]:
+        turns.append({"role": message.role, "content": message.content})
+    turns.append({"role": "user", "content": content})
+    return turns, rag_chunks
+
+
+async def _persist(
+    request: Request,
+    *,
+    session_id: UUID,
+    role: str,
+    content: str,
+    provider: str | None = None,
+    model: str | None = None,
+    mock: bool = False,
+) -> None:
+    repo = _repository(request)
+    await repo.append_message(
+        session_id=session_id,
+        role=role,  # type: ignore[arg-type]
+        content=content,
+        provider=provider,
+        model=model,
+        mock=mock,
+    )
+    await repo.touch_session(session_id=session_id)
+
+
+@router.post(
+    "",
+    response_model=ChatResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Send a chat turn to the assistant",
+)
+async def chat(request: Request, body: ChatRequest) -> ChatResponse:
+    """非流式对话：持久化消息并返回助手完整回复。"""
+
+    llm = request.app.state.llm_client
+    request_id = getattr(request.state, "request_id", "unknown")
+    session = await _resolve_session(request, body.session_id, body.content)
+    await _persist(request, session_id=session.id, role="user", content=body.content)
+
+    turns, rag_chunks = await _build_turns(request, session.id, body.content)
+    try:
+        result = await llm.chat(
+            messages=turns, request_id=request_id, rag_chunks=rag_chunks
+        )
+    except ChatProviderError as exc:
+        raise ApiError(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            code=exc.code,
+            message="The AI assistant is temporarily unavailable.",
+        ) from exc
+
+    await _persist(
+        request,
+        session_id=session.id,
+        role="assistant",
+        content=result.text,
+        provider=result.provider,
+        model=result.model,
+        mock=result.mock,
+    )
+    return ChatResponse(
+        reply=result.text,
+        session_id=session.id,
+        model=result.model,
+        provider=result.provider,
+        mock=result.mock,
+        latency_ms=result.latency_ms,
+    )
+
+
+@router.post(
+    "/stream",
+    response_model=None,
+    status_code=status.HTTP_200_OK,
+    summary="Stream a chat turn from the assistant (SSE)",
+)
+async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
+    """SSE 流式对话：逐段推送助手回复增量，结束时落库。"""
+
+    llm = request.app.state.llm_client
+    request_id = getattr(request.state, "request_id", "unknown")
+
+    async def event_source():
+        try:
+            session = await _resolve_session(request, body.session_id, body.content)
+            await _persist(
+                request, session_id=session.id, role="user", content=body.content
+            )
+            turns, rag_chunks = await _build_turns(request, session.id, body.content)
+
+            mode = body.mode or "auto"
+            web_search = getattr(request.app.state, "web_search", None)
+
+            # 模式提示词：明确约束模型行为。
+            mode_note = {
+                "knowledge": (
+                    "\n\n【当前模式：仅知识库】请只依据内部知识库回答；"
+                    "若知识库没有相关信息，如实说明不知道，不要编造或猜测实时信息。"
+                ),
+                "web": (
+                    "\n\n【当前模式：始终联网】请优先使用提供的网络搜索结果回答最新/通用问题，"
+                    "并在回答中尽量标注来源。"
+                ),
+                "auto": "",
+            }.get(mode, "")
+            if mode_note:
+                turns[0] = {**turns[0], "content": turns[0]["content"] + mode_note}
+
+            # 开头先推送元信息（会话 ID、模型、接入状态、RAG 来源）。
+            yield _sse(
+                {
+                    "type": "meta",
+                    "session_id": str(session.id),
+                    "model": llm.model,
+                    "provider": llm.provider,
+                    "mock": not llm.configured,
+                    "mode": mode,
+                    "rag": [
+                        {
+                            "source": chunk.source,
+                            "heading": chunk.heading,
+                            "score": round(chunk.score, 3),
+                        }
+                        for chunk in rag_chunks
+                    ],
+                }
+            )
+
+            tools = None
+            tool_used = False
+            web_count = 0
+            buffer: list[str] = []
+
+            # 模式分支：
+            # - knowledge：不联网、不传工具
+            # - web：无条件检索并注入上下文，再作答（不传工具）
+            # - auto：传工具，由模型决定是否联网
+            if mode == "auto" and web_search is not None:
+                tools = [WEB_SEARCH_TOOL]
+            elif mode == "web" and web_search is not None:
+                results = await web_search.search(body.content)
+                web_count = len(results)
+                if results:
+                    turns[0] = {
+                        **turns[0],
+                        "content": turns[0]["content"] + format_web_context(results),
+                    }
+                yield _sse(
+                    {
+                        "type": "search",
+                        "query": body.content,
+                        "results": [
+                            {"title": r.title, "url": r.url, "snippet": r.snippet}
+                            for r in results
+                        ],
+                    }
+                )
+
+            # 工具循环：auto 模式下模型可先请求 web_search，执行后基于结果作答。
+            for _round in range(2):
+                tool_call_event = None
+                async for event in llm.stream_round(
+                    messages=turns,
+                    request_id=request_id,
+                    tools=tools,
+                    rag_chunks=rag_chunks,
+                ):
+                    if event.kind == "delta":
+                        buffer.append(event.text)
+                        yield _sse({"type": "delta", "text": event.text})
+                    elif event.kind == "tool_call":
+                        tool_call_event = event
+
+                if tool_call_event is None or tool_call_event.tool_call is None:
+                    break
+
+                tool_call = tool_call_event.tool_call
+                if tool_call.name != "web_search":
+                    break
+                tool_used = True
+                try:
+                    arguments = json.loads(tool_call.arguments or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                query = str(arguments.get("query", "")).strip()
+
+                results = await web_search.search(query) if query else []
+                web_count = len(results)
+                yield _sse(
+                    {
+                        "type": "search",
+                        "query": query,
+                        "results": [
+                            {"title": r.title, "url": r.url, "snippet": r.snippet}
+                            for r in results
+                        ],
+                    }
+                )
+
+                # 追加助手工具调用与工具结果，进入第二轮生成最终回答。
+                turns = [
+                    *turns,
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": tool_call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call.name,
+                                    "arguments": tool_call.arguments,
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": format_web_results(results),
+                    },
+                ]
+                tools = None  # 第二轮不再给工具，避免死循环
+
+            reply = "".join(buffer)
+            await _persist(
+                request,
+                session_id=session.id,
+                role="assistant",
+                content=reply,
+                provider=llm.provider,
+                model=llm.model,
+                mock=not llm.configured,
+            )
+            yield _sse(
+                {
+                    "type": "done",
+                    "session_id": str(session.id),
+                    "model": llm.model,
+                    "provider": llm.provider,
+                    "mock": not llm.configured,
+                    "mode": mode,
+                    "web": tool_used or mode == "web",
+                    "web_count": web_count,
+                    "rag_count": len(rag_chunks),
+                }
+            )
+        except ChatProviderError as exc:
+            yield _sse({"type": "error", "code": exc.code, "message": exc.message})
+        except ApiError as exc:
+            yield _sse(
+                {
+                    "type": "error",
+                    "code": exc.code,
+                    "message": exc.message,
+                    "status": exc.status_code,
+                }
+            )
+        except Exception:  # noqa: BLE001 - SSE 生成器必须兜底任何异常并转为 error 事件
+            yield _sse(
+                {
+                    "type": "error",
+                    "code": "INTERNAL_ERROR",
+                    "message": "An unexpected error occurred.",
+                }
+            )
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post(
+    "/handoff",
+    response_model=HandoffResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a human-handoff ticket",
+)
+async def handoff(request: Request, body: HandoffRequest) -> HandoffResponse:
+    """创建人工转接工单；未提供会话时自动开一个。"""
+
+    repo = _repository(request)
+    if body.session_id is None:
+        session = await repo.create_session(title="人工转接咨询")
+        session_id = session.id
+    else:
+        session = await repo.get_session(session_id=body.session_id)
+        if session is None:
+            raise ApiError(
+                status_code=status.HTTP_404_NOT_FOUND,
+                code="SESSION_NOT_FOUND",
+                message="The conversation session does not exist.",
+            )
+        session_id = session.id
+
+    ticket = await repo.create_ticket(
+        session_id=session_id,
+        contact_name=body.contact_name,
+        contact_type=body.contact_type,
+        contact_value=body.contact_value,
+        subject=body.subject,
+    )
+    return HandoffResponse(
+        ticket_id=ticket.id,
+        session_id=session_id,
+        message="已转人工客服，我们将在工作时间内尽快与你联系。",
+    )
+
+
+@router.get(
+    "/config",
+    response_model=ChatConfigResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get the assistant onboarding configuration",
+)
+async def chat_config(request: Request) -> ChatConfigResponse:
+    """返回前端渲染欢迎页与状态徽标所需的信息。"""
+
+    settings = request.app.state.settings
+    llm = request.app.state.llm_client
+    profile: AssistantProfile = build_assistant_profile(
+        product_name=settings.saas_product_name,
+        company_name=settings.saas_company_name,
+    )
+    rag = getattr(request.app.state, "rag", None)
+
+    return ChatConfigResponse(
+        product_name=profile.product_name,
+        company_name=profile.company_name,
+        assistant_name=profile.assistant_name,
+        greeting=profile.greeting,
+        configured=llm.configured,
+        provider=llm.provider,
+        model=settings.llm_model,
+        rag_docs=rag.document_count if rag else 0,
+        rag_chunks=rag.chunk_count if rag else 0,
+        quick_questions=[
+            {"label": q.label, "question": q.question}
+            for q in profile.quick_questions
+        ],
+    )

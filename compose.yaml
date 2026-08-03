@@ -1,0 +1,57 @@
+services:
+  backend:
+    build: ./backend
+    environment:
+      APP_ENV: local
+      CORS_ALLOW_ORIGINS: http://localhost:5173,http://localhost:5174
+      # 大模型接入：未配置 Key 时进入演示模式；填入 .env 后即接入真实大模型。
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
+      SAAS_PRODUCT_NAME: ${SAAS_PRODUCT_NAME:-云枢 CloudHub}
+      SAAS_COMPANY_NAME: ${SAAS_COMPANY_NAME:-云枢科技}
+      # RAG 知识库：目录随后端镜像/挂载进入 /app/knowledge_base。
+      RAG_ENABLED: ${RAG_ENABLED:-true}
+      RAG_TOP_K: ${RAG_TOP_K:-3}
+      # 网络搜索：模型按需联网查询。
+      WEB_SEARCH_ENABLED: ${WEB_SEARCH_ENABLED:-true}
+      WEB_SEARCH_PROVIDER: ${WEB_SEARCH_PROVIDER:-duckduckgo}
+      WEB_SEARCH_MAX_RESULTS: ${WEB_SEARCH_MAX_RESULTS:-5}
+      # 会话持久化：必须使用 postgresql+psycopg scheme。
+      DATABASE_URL: postgresql+psycopg://saasuser:dev-password@postgres:5432/saasdb
+      # 源码目录绑定到宿主机时不生成容器用户所属的 pycache，避免本地检查遇到权限冲突。
+      PYTHONDONTWRITEBYTECODE: "1"
+    depends_on:
+      - postgres
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      BACKEND_PROXY_TARGET: http://backend:8000
+    ports:
+      - "5173:5173"
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: saasdb
+      POSTGRES_USER: saasuser
+      POSTGRES_PASSWORD: dev-password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  postgres-data:

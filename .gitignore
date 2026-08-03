@@ -1,0 +1,19 @@
+*.pyc
+__pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# 环境与密钥（绝不提交真实 Key）
+.env
+
+# Vite / Node
+node_modules
+dist
+dist-ssr
+.vite/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store

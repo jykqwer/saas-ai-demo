@@ -1,0 +1,21 @@
+# 数据库迁移 Job：应用启动不会自动改 Schema，迁移是独立、可审查的部署步骤。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backend-migration-0001
+  namespace: saas-ai
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: docker.io/jykqwer/saas-ai-backend:latest
+          imagePullPolicy: IfNotPresent
+          command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL

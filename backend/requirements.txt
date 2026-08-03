@@ -1,0 +1,11 @@
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+# httpx 负责调用 OpenAI 兼容的 chat/completions 接口（OpenAI / DeepSeek / Moonshot 等）。
+httpx>=0.27,<1.0
+# pydantic 由 FastAPI 引入，这里显式声明版本约束以锁定行为。
+pydantic>=2.7,<3.0
+# 会话持久化：SQLAlchemy 负责类型化 ORM；Alembic 是唯一生产 Schema 迁移入口。
+SQLAlchemy>=2.0,<3.0
+alembic>=1.14,<2.0
+# Psycopg 3 同时支持异步应用连接和同步迁移；预编译安装包避免本地编译 libpq。
+psycopg[binary]>=3.2,<4.0

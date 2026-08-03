@@ -13,23 +13,42 @@ def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
-DDG_HTML = """
-<html><body>
-<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&rut=abc">
-  Example <b>Page</b>
-</a>
-<a class="result__snippet" href="#">这是 <b>片段</b> 描述</a>
-<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ffoo.com%2Fx&rut=def">
-  Foo Bar
-</a>
-<a class="result__snippet" href="#">Foo snippet text</a>
-</body></html>
-"""
+def test_tavily_parsing_and_auth() -> None:
+    payload = {
+        "results": [
+            {
+                "title": "Example Page",
+                "url": "https://example.com/page",
+                "content": "这是结果摘要",
+                "score": 0.9,
+            },
+            {
+                "title": "Foo Bar",
+                "url": "https://foo.com/x",
+                "content": "Foo snippet text",
+                "score": 0.8,
+            },
+        ]
+    }
 
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://api.tavily.com/search"
+        assert request.headers["Authorization"] == "Bearer tvly-test"
+        body = json.loads(request.content)
+        assert body == {
+            "query": "测试",
+            "search_depth": "basic",
+            "max_results": 5,
+            "include_answer": False,
+            "include_raw_content": False,
+        }
+        return httpx.Response(200, json=payload)
 
-def test_duckduckgo_parsing() -> None:
-    transport = httpx.MockTransport(lambda req: httpx.Response(200, text=DDG_HTML))
-    client = WebSearchClient(provider="duckduckgo", transport=transport)
+    client = WebSearchClient(
+        provider="tavily",
+        api_key="tvly-test",
+        transport=httpx.MockTransport(handler),
+    )
     try:
         results = _run(client.search("测试"))
     finally:
@@ -38,44 +57,29 @@ def test_duckduckgo_parsing() -> None:
     assert len(results) == 2
     assert results[0].url == "https://example.com/page"
     assert results[0].title == "Example Page"
-    assert "片段" in results[0].snippet
+    assert "摘要" in results[0].snippet
     assert results[1].url == "https://foo.com/x"
 
 
-def test_duckduckgo_empty_returns_none() -> None:
+def test_tavily_empty_returns_none() -> None:
     transport = httpx.MockTransport(
-        lambda req: httpx.Response(200, text="<html>no results</html>")
+        lambda req: httpx.Response(200, json={"results": []})
     )
-    client = WebSearchClient(provider="duckduckgo", transport=transport)
+    client = WebSearchClient(
+        provider="tavily", api_key="tvly-test", transport=transport
+    )
     try:
         assert _run(client.search("不存在")) == []
     finally:
         _run(client.close())
 
 
-def test_duckduckgo_filters_ad_links() -> None:
-    """广告/追踪链接（duckduckgo.com/y.js?ad_domain=...）不应被当作来源。"""
-
-    html_text = """
-    <html><body>
-    <a class="result__a" href="https://duckduckgo.com/y.js?ad_domain=artlist.io&amp;ad_provider=bingv7aa&amp;u3=https%3A%2F%2Fwww.bing.com%2Faclick%3Fld%3Dabc">
-      赞助商广告链接
-    </a>
-    <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Freal&rut=abc">
-      Real Result
-    </a>
-    </body></html>
-    """
-    transport = httpx.MockTransport(lambda req: httpx.Response(200, text=html_text))
-    client = WebSearchClient(provider="duckduckgo", transport=transport)
+def test_tavily_requires_api_key() -> None:
+    client = WebSearchClient(provider="tavily")
     try:
-        results = _run(client.search("测试"))
+        assert _run(client.search("测试")) == []
     finally:
         _run(client.close())
-
-    assert len(results) == 1
-    assert results[0].url == "https://example.com/real"
-    assert "duckduckgo.com" not in results[0].url
 
 
 def test_wikipedia_parsing() -> None:
@@ -109,14 +113,14 @@ def test_wikipedia_parsing() -> None:
 
 
 def test_fallback_to_next_provider() -> None:
-    """duckduckgo 失败/空时自动回退到 wikipedia。"""
+    """Tavily 失败/空时，auto 模式应自动回退到 Wikipedia。"""
 
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.host)
-        if "duckduckgo" in request.url.host:
-            return httpx.Response(200, text="<html>nothing</html>")
+        if "tavily" in request.url.host:
+            return httpx.Response(200, json={"results": []})
         return httpx.Response(
             200,
             json={
@@ -127,7 +131,9 @@ def test_fallback_to_next_provider() -> None:
         )
 
     transport = httpx.MockTransport(handler)
-    client = WebSearchClient(provider="auto", transport=transport)
+    client = WebSearchClient(
+        provider="auto", api_key="tvly-test", transport=transport
+    )
     try:
         results = _run(client.search("测试"))
     finally:
@@ -135,18 +141,20 @@ def test_fallback_to_next_provider() -> None:
 
     assert results
     assert results[0].title == "兜底结果"
-    assert "duckduckgo" in calls[0]
+    assert "tavily" in calls[0]
     assert "wikipedia" in calls[1]
 
 
 def test_http_error_falls_back() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if "duckduckgo" in request.url.host:
+        if "tavily" in request.url.host:
             return httpx.Response(500)
         return httpx.Response(200, json={"query": {"search": [{"title": "T", "snippet": "S"}]}})
 
     transport = httpx.MockTransport(handler)
-    client = WebSearchClient(provider="auto", transport=transport)
+    client = WebSearchClient(
+        provider="auto", api_key="tvly-test", transport=transport
+    )
     try:
         results = _run(client.search("测试"))
     finally:

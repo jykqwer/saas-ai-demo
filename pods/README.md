@@ -24,6 +24,7 @@ kubectl -n saas-ai create secret generic llm-credentials \
   --from-literal=LLM_API_KEY="sk-xxxx" \
   --from-literal=LLM_BASE_URL="https://api.deepseek.com" \
   --from-literal=LLM_MODEL="deepseek-chat" \
+  --from-literal=TAVILY_API_KEY="tvly-xxxx" \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 

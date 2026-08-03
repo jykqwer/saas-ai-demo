@@ -16,19 +16,23 @@ services:
       RAG_TOP_K: ${RAG_TOP_K:-3}
       # 网络搜索：模型按需联网查询。
       WEB_SEARCH_ENABLED: ${WEB_SEARCH_ENABLED:-true}
-      WEB_SEARCH_PROVIDER: ${WEB_SEARCH_PROVIDER:-duckduckgo}
+      WEB_SEARCH_PROVIDER: ${WEB_SEARCH_PROVIDER:-tavily}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       WEB_SEARCH_MAX_RESULTS: ${WEB_SEARCH_MAX_RESULTS:-5}
       # 会话持久化：必须使用 postgresql+psycopg scheme。
       DATABASE_URL: postgresql+psycopg://saasuser:dev-password@postgres:5432/saasdb
       # 源码目录绑定到宿主机时不生成容器用户所属的 pycache，避免本地检查遇到权限冲突。
       PYTHONDONTWRITEBYTECODE: "1"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     volumes:
       - ./backend:/app
     ports:
       - "8000:8000"
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    command: >
+      sh -c "alembic -c alembic.ini upgrade head &&
+             exec uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
 
   frontend:
     build:
@@ -50,6 +54,11 @@ services:
       POSTGRES_PASSWORD: dev-password
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U saasuser -d saasdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     volumes:
       - postgres-data:/var/lib/postgresql/data
 

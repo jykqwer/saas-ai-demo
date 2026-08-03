@@ -5,6 +5,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from api.v1.chat import _merge_source_rows
 from core.config import Settings
 from core.llm import LLMToolCall, StreamEvent
 from domain.chat import RETRIEVE_KB_TOOL, WEB_SEARCH_TOOL
@@ -156,6 +157,27 @@ def test_stream_mock_reply(client: TestClient) -> None:
 
     history = client.get(f"/api/v1/sessions/{meta['session_id']}").json()
     assert len(history["messages"]) == 2
+
+
+def test_merge_source_rows_preserves_previous_results() -> None:
+    """后续空检索或重复结果不应清掉前一轮已采用的来源。"""
+
+    first = [{"title": "A", "url": "https://a.example", "snippet": "old"}]
+    assert _merge_source_rows(first, [], keys=("url",)) == first
+
+    merged = _merge_source_rows(
+        first,
+        [
+            {"title": "A2", "url": "https://a.example", "snippet": "new"},
+            {"title": "B", "url": "https://b.example", "snippet": "b"},
+        ],
+        keys=("url",),
+    )
+    assert [row["url"] for row in merged] == [
+        "https://a.example",
+        "https://b.example",
+    ]
+    assert merged[0]["title"] == "A2"
 
 
 def test_auto_mode_tools_disabled_web_keeps_rag() -> None:
@@ -453,4 +475,3 @@ def test_rag_mock_answers_from_knowledge_base(client: TestClient) -> None:
 def test_request_id_header(client: TestClient) -> None:
     response = client.get("/api/v1/health/live")
     assert response.headers.get("X-Request-ID", "").startswith("req_")
-

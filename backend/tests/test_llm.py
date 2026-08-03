@@ -56,13 +56,81 @@ def test_stream_round_detects_text_tool_call() -> None:
 
     deltas = [e.text for e in events if e.kind == "delta"]
     # 标记不应出现在回答里；普通文本应正常流式输出。
-    assert deltas == ["让我查一下", "以上就是结果"]
+    assert deltas == ["让我查一下以上就是结果"]
 
     calls = [e.tool_call for e in events if e.kind == "tool_call" and e.tool_call]
     assert len(calls) == 1
     assert calls[0].name == "web_search"
     arguments = json.loads(calls[0].arguments)
     assert arguments["query"] == "鲁卫英 介绍"
+
+
+def test_stream_round_detects_real_deepseek_dsml_tool_call() -> None:
+    """真实 DeepSeek DSML 标签应被执行，不能作为可见文本泄漏。"""
+
+    sse = (
+        'data: {"choices":[{"delta":{"reasoning_content":"需要进一步检索"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"<｜｜DSML｜｜tool_calls>\\n<｜｜DSML｜｜inv"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"oke name=\\"web_search\\">\\n<｜｜DSML｜｜parameter name=\\"query\\" string=\\"true\\">\\"鲁卫英\\" 人物 介绍</｜｜DSML｜｜parameter>\\n</｜｜DSML｜｜invoke>\\n</｜｜DSML｜｜tool_calls>"}}]}\n\n'
+        'data: [DONE]\n\n'
+    )
+    client = _make_client(
+        lambda req: httpx.Response(
+            200, text=sse, headers={"content-type": "text/event-stream"}
+        )
+    )
+
+    async def run():
+        events = []
+        async for event in client.stream_round(
+            messages=[{"role": "user", "content": "鲁卫英是谁"}],
+            request_id="req_dsml",
+        ):
+            events.append(event)
+        await client.close()
+        return events
+
+    events = _run(run())
+    assert [event for event in events if event.kind == "delta"] == []
+
+    calls = [
+        event.tool_call
+        for event in events
+        if event.kind == "tool_call" and event.tool_call is not None
+    ]
+    assert len(calls) == 1
+    assert calls[0].name == "web_search"
+    assert calls[0].reasoning_content == "需要进一步检索"
+    assert json.loads(calls[0].arguments)["query"] == '"鲁卫英" 人物 介绍'
+
+
+def test_stream_round_deduplicates_text_and_structured_tool_call() -> None:
+    """兼容接口同时返回文本和结构化表示时，同一工具只能执行一次。"""
+
+    sse = (
+        'data: {"choices":[{"delta":{"content":"<invoke name=\\"web_search\\"><parameter name=\\"query\\">测试</parameter></invoke>"}}]}\n\n'
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"web_search","arguments":"{\\"query\\":\\"测试\\"}"}}]}}]}\n\n'
+        'data: [DONE]\n\n'
+    )
+    client = _make_client(
+        lambda req: httpx.Response(
+            200, text=sse, headers={"content-type": "text/event-stream"}
+        )
+    )
+
+    async def run():
+        events = []
+        async for event in client.stream_round(
+            messages=[{"role": "user", "content": "测试"}],
+            request_id="req_dedupe",
+        ):
+            events.append(event)
+        await client.close()
+        return events
+
+    events = _run(run())
+    calls = [event for event in events if event.kind == "tool_call"]
+    assert len(calls) == 1
 
 
 def test_strip_text_tool_calls() -> None:
@@ -75,3 +143,14 @@ def test_strip_text_tool_calls() -> None:
     assert "<invoke" not in cleaned
     assert "好的" in cleaned
     assert "结果如下" in cleaned
+
+
+def test_strip_real_deepseek_dsml_tool_calls() -> None:
+    text = (
+        "<｜｜DSML｜｜tool_calls>"
+        '<｜｜DSML｜｜invoke name="web_search">'
+        '<｜｜DSML｜｜parameter name="query" string="true">测试</｜｜DSML｜｜parameter>'
+        "</｜｜DSML｜｜invoke>"
+        "</｜｜DSML｜｜tool_calls>"
+    )
+    assert strip_text_tool_calls(text) == ""

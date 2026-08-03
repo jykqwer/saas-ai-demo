@@ -37,6 +37,27 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _merge_source_rows(
+    existing: list[dict], incoming: list[dict], *, keys: tuple[str, ...]
+) -> list[dict]:
+    """按稳定字段合并来源；重复项更新内容，同时保持首次出现顺序。"""
+
+    merged = list(existing)
+    positions = {
+        tuple(str(row.get(key, "")) for key in keys): index
+        for index, row in enumerate(merged)
+    }
+    for row in incoming:
+        identity = tuple(str(row.get(key, "")) for key in keys)
+        index = positions.get(identity)
+        if index is None:
+            positions[identity] = len(merged)
+            merged.append(row)
+        else:
+            merged[index] = row
+    return merged
+
+
 class ChatRequest(BaseModel):
     """单轮聊天请求：只携带本条用户消息，历史由服务端从仓库加载。"""
 
@@ -434,16 +455,22 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                             if web_search is not None and query
                             else []
                         )
-                        web_count = len(results)
-                        used_web_meta = [
+                        current_web_meta = [
                             {"title": r.title, "url": r.url, "snippet": r.snippet}
                             for r in results
                         ]
+                        used_web_meta = _merge_source_rows(
+                            used_web_meta,
+                            current_web_meta,
+                            keys=("url",),
+                        )
+                        web_count = len(used_web_meta)
                         web_query = query
                         yield _sse(
                             {
                                 "type": "search",
                                 "query": query,
+                                # 推送累计来源，后一次空结果不会清掉前一次有效来源。
                                 "results": used_web_meta,
                             }
                         )
@@ -455,8 +482,7 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                             if rag is not None and query
                             else []
                         )
-                        rag_count = len(chunks)
-                        used_rag_meta = [
+                        current_rag_meta = [
                             {
                                 "source": c.source,
                                 "heading": c.heading,
@@ -464,6 +490,12 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                             }
                             for c in chunks
                         ]
+                        used_rag_meta = _merge_source_rows(
+                            used_rag_meta,
+                            current_rag_meta,
+                            keys=("source", "heading"),
+                        )
+                        rag_count = len(used_rag_meta)
                         yield _sse({"type": "rag_used", "rag": used_rag_meta})
                         tool_content = format_rag_tool_results(chunks)
                     else:
@@ -508,16 +540,16 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                 # 关键：不设 tools=None，保留工具定义让模型可连续多轮调用；
                 # 由 MAX_TOOL_ROUNDS 上限兜底，杜绝死循环。
             else:
-                # 达到轮次上限仍未输出自然语言：用无工具轮强制收敛，避免空回答。
-                async for event in llm.stream_round(
-                    messages=turns,
-                    request_id=request_id,
-                    tools=None,
-                    rag_chunks=rag_chunks,
-                ):
-                    if event.kind == "delta":
-                        buffer.append(event.text)
-                        yield _sse({"type": "delta", "text": event.text})
+                # 不再通过 tools=None 强迫模型收敛：这会让模型把内部 DSML 当文本
+                # 输出。达到上限后返回受控错误，保证内部协议不会展示或落库。
+                yield _sse(
+                    {
+                        "type": "error",
+                        "code": "TOOL_ROUND_LIMIT",
+                        "message": "检索次数过多，请缩小问题范围后重试。",
+                    }
+                )
+                return
 
             reply = strip_text_tool_calls("".join(buffer))
             # 组装本轮实际采用的来源，随助手消息落库以便刷新后恢复展示。

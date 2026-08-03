@@ -84,15 +84,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     else:
         app.state.rag = None
 
-    # 网络搜索：启用时允许模型通过 web_search 工具联网查询。
-    if resolved_settings.web_search_enabled:
+    # 网络搜索：Tavily 必须配置 Key；缺失时不暴露工具，避免静默返回空结果。
+    tavily_ready = (
+        resolved_settings.web_search_provider != "tavily"
+        or bool(resolved_settings.tavily_api_key)
+    )
+    if resolved_settings.web_search_enabled and tavily_ready:
         app.state.web_search = WebSearchClient(
             provider=resolved_settings.web_search_provider,
+            api_key=resolved_settings.tavily_api_key,
             timeout_seconds=resolved_settings.web_search_timeout_seconds,
             max_results=resolved_settings.web_search_max_results,
         )
     else:
         app.state.web_search = None
+        if resolved_settings.web_search_enabled and not tavily_ready:
+            get_logger().warning(
+                "web_search_not_configured",
+                extra={"provider": resolved_settings.web_search_provider},
+            )
 
     # 会话仓库：配置 DATABASE_URL 时使用 PostgreSQL 持久化，否则用内存实现。
     if resolved_settings.database_url is not None:

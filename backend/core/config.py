@@ -99,7 +99,8 @@ class Settings:
 
     # 网络搜索：让模型在知识库之外也能通过工具调用联网查询。
     web_search_enabled: bool = True
-    web_search_provider: str = "duckduckgo"
+    web_search_provider: str = "tavily"
+    tavily_api_key: str | None = None
     web_search_max_results: int = 5
     web_search_timeout_seconds: float = 10.0
 
@@ -117,6 +118,10 @@ class Settings:
             raise ValueError("LLM_TIMEOUT_SECONDS must be positive")
         if self.llm_max_context_turns <= 0:
             raise ValueError("LLM_MAX_CONTEXT_TURNS must be positive")
+        if self.web_search_provider not in {"tavily", "wikipedia", "auto"}:
+            raise ValueError(
+                f"Unsupported web search provider: {self.web_search_provider}"
+            )
 
         # 显式指定 Psycopg 3 方言，确保异步运行时和同步迁移使用同一种驱动。
         if self.database_url is not None and not self.database_url.startswith(
@@ -181,8 +186,9 @@ def _build_settings() -> Settings:
             "WEB_SEARCH_ENABLED", os.getenv("WEB_SEARCH_ENABLED"), True
         ),
         web_search_provider=os.getenv(
-            "WEB_SEARCH_PROVIDER", "duckduckgo"
+            "WEB_SEARCH_PROVIDER", "tavily"
         ),
+        tavily_api_key=os.getenv("TAVILY_API_KEY") or None,
         web_search_max_results=_parse_int(
             "WEB_SEARCH_MAX_RESULTS", os.getenv("WEB_SEARCH_MAX_RESULTS"), 5
         ),

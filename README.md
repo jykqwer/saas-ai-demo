@@ -104,7 +104,8 @@ npm run build
 | `RAG_MIN_SCORE` | `1.0` | 全局检索的最低相关度阈值，过滤明显无关片段；显式按文档过滤时不生效 |
 | `RAG_KNOWLEDGE_BASE_DIR` | `knowledge_base` | 知识库 Markdown 目录 |
 | `WEB_SEARCH_ENABLED` | `true` | 是否允许模型联网查询 |
-| `WEB_SEARCH_PROVIDER` | `duckduckgo` | 搜索提供方：`duckduckgo` / `wikipedia` / `auto` |
+| `WEB_SEARCH_PROVIDER` | `tavily` | 搜索提供方：`tavily` / `wikipedia` / `auto` |
+| `TAVILY_API_KEY` | 空 | Tavily Search API Key；provider 为 `tavily` 时必需 |
 | `WEB_SEARCH_MAX_RESULTS` | `5` | 每次联网返回的结果数 |
 | `CORS_ALLOW_ORIGINS` | 空 | 逗号分隔的可信浏览器 Origin，禁止通配 |
 | `LOG_LEVEL` | `INFO` | 结构化日志级别 |

@@ -15,6 +15,7 @@ import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal
+from uuid import uuid4
 
 import httpx
 
@@ -99,40 +100,67 @@ def _split_mock_chunks(text: str, max_chunk: int = 24) -> list[str]:
 
 
 # 模型偶发把工具调用"写成文本"（而非结构化 tool_calls 字段）时的解析。
-# 这类文本不应作为回答展示，而应转成真正的工具调用执行。
+# 兼容普通 <invoke>、Anthropic 风格 <antml:invoke>，以及 DeepSeek 偶发泄漏的
+# <｜｜DSML｜｜invoke>（也兼容半角竖线版本）。
+_TEXT_TOOL_PREFIX = r"(?:(?:antml:)|(?:(?:\|\||｜｜)DSML(?:\|\||｜｜)))?"
 _TEXT_INVOKE_RE = re.compile(
-    r"<(?:antml:)?invoke\s+name=[\"'](?P<name>[^\"']+)[\"']>(?P<body>.*?)"
-    r"</(?:antml:)?invoke>",
+    rf"<{_TEXT_TOOL_PREFIX}invoke\b[^>]*\bname=[\"'](?P<name>[^\"']+)[\"'][^>]*>"
+    rf"(?P<body>.*?)</{_TEXT_TOOL_PREFIX}invoke\s*>",
     re.DOTALL | re.IGNORECASE,
 )
 _TEXT_QUERY_PARAM_RE = re.compile(
-    r"<(?:antml:)?parameter\s+name=[\"']query[\"']>(?P<query>.*?)"
-    r"</(?:antml:)?parameter>",
+    rf"<{_TEXT_TOOL_PREFIX}parameter\b(?=[^>]*\bname=[\"']query[\"'])[^>]*>"
+    rf"(?P<query>.*?)</{_TEXT_TOOL_PREFIX}parameter\s*>",
     re.DOTALL | re.IGNORECASE,
 )
+_TEXT_TOOL_WRAPPER_RE = re.compile(
+    rf"</?{_TEXT_TOOL_PREFIX}tool_calls\b[^>]*>",
+    re.IGNORECASE,
+)
 _KNOWN_TOOL_NAMES = {"web_search", "retrieve_knowledge_base"}
-_TEXT_TOOL_OPENINGS = ("<invoke", "<antml:invoke")
-
-
-def _is_text_tool_open(text: str) -> bool:
-    """待定内容是否可能是文本化工具调用的开头（是则暂挂等待完整块）。
-
-    两种情况都算"开头"：
-    - 待定文本是标记开头的增量前缀（如 "<"、 "<invoke"）；
-    - 待定文本已经包含完整未闭合的开标记（如 "<invoke name=...>"）。
-    """
-
-    t = text.lstrip().lower()
-    return any(
-        t.startswith(opening) or opening.startswith(t)
-        for opening in _TEXT_TOOL_OPENINGS
-    )
 
 
 def strip_text_tool_calls(text: str) -> str:
     """从最终文本里剔除残留的工具调用标记（兜底清理）。"""
 
-    return _TEXT_INVOKE_RE.sub("", text).strip()
+    cleaned = _TEXT_INVOKE_RE.sub("", text)
+    return _TEXT_TOOL_WRAPPER_RE.sub("", cleaned).strip()
+
+
+def _parse_text_tool_calls(text: str, reasoning: str) -> list[LLMToolCall]:
+    """把完整响应文本中的已知工具标记转换成结构化工具调用。"""
+
+    calls: list[LLMToolCall] = []
+    for match in _TEXT_INVOKE_RE.finditer(text):
+        name = match.group("name").strip()
+        if name not in _KNOWN_TOOL_NAMES:
+            continue
+        query_match = _TEXT_QUERY_PARAM_RE.search(match.group("body"))
+        query = query_match.group("query").strip() if query_match else ""
+        calls.append(
+            LLMToolCall(
+                id=f"text_call_{uuid4().hex}",
+                name=name,
+                arguments=json.dumps({"query": query}, ensure_ascii=False),
+                reasoning_content=reasoning,
+            )
+        )
+    return calls
+
+
+def _tool_call_identity(call: LLMToolCall) -> tuple[str, str]:
+    """生成与 JSON 空白和键顺序无关的工具调用标识，用于去重。"""
+
+    try:
+        arguments = json.dumps(
+            json.loads(call.arguments),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        arguments = call.arguments.strip()
+    return call.name, arguments
 
 
 class LLMClient:
@@ -311,9 +339,8 @@ class LLMClient:
 
         tool_calls: dict[int, dict[str, str]] = {}
         reasoning_parts: list[str] = []
-        # 暂挂可能属于"文本化工具调用"的内容，等待完整块或判定为普通文本。
-        pending: list[str] = []
-        text_call_index = 0
+        # 先保留本轮文本，流结束后统一识别可能跨多个 SSE 分片的文本化工具调用。
+        content_parts: list[str] = []
         try:
             async with self._http.stream(
                 "POST",
@@ -349,50 +376,7 @@ class LLMClient:
                     delta = choice.get("delta", {})
                     content = delta.get("content")
                     if content:
-                        # 识别"写成文本"的工具调用：不把标记当回答流式输出，
-                        # 暂挂并转成真正的 tool_call 事件。
-                        pending.append(content)
-                        while True:
-                            joined = "".join(pending)
-                            match = _TEXT_INVOKE_RE.search(joined)
-                            if not match:
-                                break
-                            name = match.group("name").strip()
-                            if name in _KNOWN_TOOL_NAMES:
-                                prefix = joined[: match.start()]
-                                if prefix.strip():
-                                    yield StreamEvent(kind="delta", text=prefix)
-                                qm = _TEXT_QUERY_PARAM_RE.search(
-                                    match.group("body")
-                                )
-                                query = (
-                                    (qm.group("query").strip() if qm else "")
-                                    .strip('"')
-                                    .strip()
-                                )
-                                text_call_index += 1
-                                yield StreamEvent(
-                                    kind="tool_call",
-                                    tool_call=LLMToolCall(
-                                        id=f"text_call_{text_call_index}",
-                                        name=name,
-                                        arguments=json.dumps(
-                                            {"query": query},
-                                            ensure_ascii=False,
-                                        ),
-                                    ),
-                                )
-                                pending = [joined[match.end():]]
-                                continue
-                            # 未知工具名：整段按普通文本输出，避免吞掉内容。
-                            yield StreamEvent(kind="delta", text=joined)
-                            pending = []
-                            break
-                        if pending:
-                            pending_text = "".join(pending)
-                            if not _is_text_tool_open(pending_text):
-                                yield StreamEvent(kind="delta", text=pending_text)
-                                pending = []
+                        content_parts.append(content)
                     # 推理型模型的思考内容：需要随工具调用一并回传。
                     reasoning = delta.get("reasoning_content")
                     if reasoning:
@@ -437,22 +421,44 @@ class LLMClient:
             },
         )
 
-        if tool_calls:
-            reasoning = "".join(reasoning_parts)
-            # 同一响应可能包含多个工具调用（如同时检索知识库与联网），逐个下发。
-            for idx in sorted(tool_calls):
-                entry = tool_calls[idx]
-                if not entry["id"] or not entry["name"]:
-                    continue
-                yield StreamEvent(
-                    kind="tool_call",
-                    tool_call=LLMToolCall(
-                        id=entry["id"],
-                        name=entry["name"],
-                        arguments=entry["arguments"],
-                        reasoning_content=reasoning,
-                    ),
-                )
+        reasoning = "".join(reasoning_parts)
+        full_content = "".join(content_parts)
+        text_calls = _parse_text_tool_calls(full_content, reasoning)
+        cleaned_content = strip_text_tool_calls(full_content)
+
+        # 普通回答保持上游分片；存在文本化工具标记时只下发清理后的可见文本。
+        if cleaned_content:
+            if cleaned_content == full_content:
+                for part in content_parts:
+                    yield StreamEvent(kind="delta", text=part)
+            else:
+                yield StreamEvent(kind="delta", text=cleaned_content)
+
+        # 同一响应可能包含多个工具调用。文本化与结构化结果按名称+参数去重，
+        # 避免某些兼容接口同时返回两种表示时重复执行工具。
+        emitted: set[tuple[str, str]] = set()
+        for call in text_calls:
+            key = _tool_call_identity(call)
+            if key in emitted:
+                continue
+            emitted.add(key)
+            yield StreamEvent(kind="tool_call", tool_call=call)
+
+        for idx in sorted(tool_calls):
+            entry = tool_calls[idx]
+            if not entry["id"] or not entry["name"]:
+                continue
+            call = LLMToolCall(
+                id=entry["id"],
+                name=entry["name"],
+                arguments=entry["arguments"],
+                reasoning_content=reasoning,
+            )
+            key = _tool_call_identity(call)
+            if key in emitted:
+                continue
+            emitted.add(key)
+            yield StreamEvent(kind="tool_call", tool_call=call)
 
     def _mock_chat(
         self,

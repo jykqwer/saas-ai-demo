@@ -75,6 +75,12 @@
   color: var(--text);
   font-weight: 600;
 }
+.user-summary {
+  justify-content: space-between;
+  padding-top: 8px;
+  margin-top: 2px;
+  border-top: 1px solid var(--panel-border);
+}
 
 .sidebar-links {
   display: flex;
@@ -928,6 +934,136 @@
 }
 .btn-danger:hover {
   background: rgba(244, 63, 94, 0.22);
+}
+
+/* ============ 登录注册 ============ */
+.app-loading,
+.auth-page {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+}
+.app-loading {
+  color: var(--text-muted);
+}
+.auth-card {
+  width: min(420px, calc(100vw - 32px));
+  padding: 34px;
+  border-radius: 22px;
+  background: rgba(21, 25, 53, 0.94);
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 28px 90px -32px rgba(0, 0, 0, 0.9);
+  text-align: center;
+}
+.auth-logo {
+  width: 64px;
+  height: 64px;
+  margin: 0 auto 16px;
+  display: grid;
+  place-items: center;
+  border-radius: 18px;
+  background: var(--grad);
+  font-size: 1.8rem;
+}
+.auth-card h1 {
+  font-size: 1.45rem;
+}
+.auth-subtitle {
+  margin: 7px 0 22px;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+.auth-tabs {
+  display: flex;
+  padding: 4px;
+  margin-bottom: 20px;
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+}
+.auth-tabs button {
+  flex: 1;
+  padding: 9px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-muted);
+}
+.auth-tabs button.active {
+  background: var(--grad);
+  color: white;
+}
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  text-align: left;
+}
+.auth-form label {
+  color: var(--text-muted);
+  font-size: 0.84rem;
+}
+.auth-form input {
+  width: 100%;
+  margin-top: 7px;
+  padding: 12px 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+  outline: none;
+}
+.auth-form input:focus {
+  border-color: rgba(99, 102, 241, 0.7);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+}
+.auth-note {
+  color: #a5b4fc;
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+.auth-notice {
+  margin: 0;
+}
+.auth-submit {
+  width: 100%;
+  justify-content: center;
+  margin-top: 2px;
+}
+
+/* ============ 用户审批 ============ */
+.user-admin-list {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  max-height: 55vh;
+  overflow-y: auto;
+  margin-top: 14px;
+}
+.user-admin-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+}
+.user-admin-name {
+  font-weight: 600;
+}
+.user-admin-meta {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+.user-status.pending { color: #fbbf24; }
+.user-status.approved { color: #6ee7b7; }
+.user-status.rejected { color: #fda4af; }
+.user-admin-actions {
+  display: flex;
+  gap: 8px;
 }
 .kb-detail-head {
   display: flex;

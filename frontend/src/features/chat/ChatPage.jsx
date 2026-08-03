@@ -3,6 +3,7 @@ import ChatMessage from './ChatMessage.jsx'
 import QuickQuestions from './QuickQuestions.jsx'
 import HandoffModal from './HandoffModal.jsx'
 import KnowledgeModal from './KnowledgeModal.jsx'
+import UserAdminModal from '../auth/UserAdminModal.jsx'
 import {
   ChatApiError,
   deleteSession,
@@ -14,7 +15,13 @@ import {
 } from './chatApi.js'
 
 
-export default function ChatPage() {
+export default function ChatPage({
+  currentUser,
+  quota,
+  onQuotaChange,
+  onLogout,
+  onSessionExpired,
+}) {
   const [config, setConfig] = useState(null)
   const [sessions, setSessions] = useState([])
   const [activeSessionId, setActiveSessionId] = useState(null)
@@ -30,6 +37,7 @@ export default function ChatPage() {
   const [knowledgeOpen, setKnowledgeOpen] = useState(false)
   const [knowledgeKey, setKnowledgeKey] = useState(2)
   const [knowledgeDocTarget, setKnowledgeDocTarget] = useState(null)
+  const [adminOpen, setAdminOpen] = useState(false)
 
   const activeSessionRef = useRef(null)
   const messagesRef = useRef(null)
@@ -143,6 +151,10 @@ export default function ChatPage() {
     async (rawText) => {
       const text = (rawText ?? input).trim()
       if (!text || streaming) return
+      if (!quota?.unlimited && (quota?.remaining ?? 0) <= 0) {
+        setError(`今日问答次数已用完（每天 ${quota?.limit ?? 10} 次），请明天再试。`)
+        return
+      }
 
       const sessionId = activeSessionRef.current
       setInput('')
@@ -162,6 +174,7 @@ export default function ChatPage() {
         {
           onMeta: (meta) => {
             if (!activeSessionRef.current) setSession(meta.session_id)
+            if (meta.quota) onQuotaChange?.(meta.quota)
             // 记录 RAG 命中的知识库来源。
             if (meta.rag?.length) {
               setMessages((prev) => {
@@ -186,6 +199,7 @@ export default function ChatPage() {
             })
           },
           onDone: (done) => {
+            if (done.quota) onQuotaChange?.(done.quota)
             setMessages((prev) => {
               const next = [...prev]
               const last = next[next.length - 1]
@@ -239,9 +253,13 @@ export default function ChatPage() {
       )
 
       // 兜底结束流式状态；网络中断未收到任何事件时移除空占位。
-      if (!result.ok && !error) {
+      if (!result.ok) {
         setError(result.error)
         removeEmptyPlaceholder()
+        if (result.status === 401) onSessionExpired?.()
+        if (result.code === 'DAILY_QUOTA_EXCEEDED') {
+          onQuotaChange?.({ ...quota, used: quota?.limit ?? 10, remaining: 0 })
+        }
       }
       setStreaming(false)
       setMessages((prev) => {
@@ -256,7 +274,17 @@ export default function ChatPage() {
       // 消息已随流式逐条维护在内存（与后端一致），只需刷新会话列表。
       refreshSessions()
     },
-    [error, input, mode, refreshSessions, removeEmptyPlaceholder, setSession, streaming],
+    [
+      input,
+      mode,
+      onQuotaChange,
+      onSessionExpired,
+      quota,
+      refreshSessions,
+      removeEmptyPlaceholder,
+      setSession,
+      streaming,
+    ],
   )
 
   const startNewConversation = useCallback(() => {
@@ -310,6 +338,8 @@ export default function ChatPage() {
 
   const configured = config?.configured ?? false
   const hasMessages = messages.length > 0
+  const isSuperuser = currentUser?.role === 'superuser'
+  const canAsk = quota?.unlimited || (quota?.remaining ?? 0) > 0
 
   return (
     <div className="app-shell">
@@ -350,6 +380,17 @@ export default function ChatPage() {
               <span>📚 RAG 知识库：{config.rag_docs} 篇文档</span>
             </div>
           )}
+          <div className="status-row user-summary">
+            <span>👤 {currentUser.username}</span>
+            <b>{isSuperuser ? 'superuser' : 'user'}</b>
+          </div>
+          <div className="status-row">
+            <span>
+              {quota?.unlimited
+                ? '今日问答：不限次数'
+                : `今日剩余：${quota?.remaining ?? 0} / ${quota?.limit ?? 10}`}
+            </span>
+          </div>
         </div>
 
         <button type="button" className="sidebar-link" onClick={startNewConversation}>
@@ -387,13 +428,24 @@ export default function ChatPage() {
 
         <div className="sidebar-spacer" />
 
-        <button
-          type="button"
-          className="sidebar-link handoff-link"
-          onClick={openKnowledge}
-        >
-          📚 知识库管理
-        </button>
+        {isSuperuser && (
+          <>
+            <button
+              type="button"
+              className="sidebar-link handoff-link"
+              onClick={() => setAdminOpen(true)}
+            >
+              👥 用户审批
+            </button>
+            <button
+              type="button"
+              className="sidebar-link handoff-link"
+              onClick={openKnowledge}
+            >
+              📚 知识库管理
+            </button>
+          </>
+        )}
         <button
           type="button"
           className="sidebar-link handoff-link"
@@ -455,6 +507,9 @@ export default function ChatPage() {
             >
               👋 转人工
             </button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={onLogout}>
+              退出
+            </button>
           </div>
         </header>
 
@@ -472,7 +527,7 @@ export default function ChatPage() {
               <QuickQuestions
                 questions={config?.quick_questions}
                 onPick={send}
-                disabled={streaming}
+                disabled={streaming || !canAsk}
               />
             </div>
           )}
@@ -490,9 +545,9 @@ export default function ChatPage() {
             <textarea
               ref={inputRef}
               rows={1}
-              placeholder="输入你的问题，按 Enter 发送，Shift+Enter 换行……"
+              placeholder={canAsk ? '输入你的问题，按 Enter 发送，Shift+Enter 换行……' : '今日问答次数已用完'}
               value={input}
-              disabled={streaming}
+              disabled={streaming || !canAsk}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
               onInput={(e) => {
@@ -504,14 +559,17 @@ export default function ChatPage() {
               type="button"
               className="send-btn"
               aria-label="发送"
-              disabled={streaming || !input.trim()}
+              disabled={streaming || !canAsk || !input.trim()}
               onClick={() => send()}
             >
               ➤
             </button>
           </div>
           <div className="input-hint">
-            按 Enter 发送 · Shift + Enter 换行 · AI 可能犯错，请核对重要信息
+            {quota?.unlimited
+              ? 'superuser 不限调用次数'
+              : `普通用户每天可问答 ${quota?.limit ?? 10} 次 · 今日剩余 ${quota?.remaining ?? 0} 次`}
+            {' · AI 可能犯错，请核对重要信息'}
           </div>
         </div>
       </main>
@@ -528,6 +586,7 @@ export default function ChatPage() {
         key={knowledgeKey}
         open={knowledgeOpen}
         initialDoc={knowledgeDocTarget}
+        readOnly={!isSuperuser}
         onClose={() => {
           setKnowledgeOpen(false)
           setKnowledgeDocTarget(null)
@@ -539,6 +598,8 @@ export default function ChatPage() {
             .catch(() => {})
         }}
       />
+
+      <UserAdminModal open={adminOpen} onClose={() => setAdminOpen(false)} />
     </div>
   )
 }

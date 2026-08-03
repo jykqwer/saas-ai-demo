@@ -12,6 +12,25 @@ export class ChatApiError extends Error {
   }
 }
 
+const TOKEN_KEY = 'cloudhub_access_token'
+
+export function getAccessToken() {
+  return window.localStorage.getItem(TOKEN_KEY) ?? ''
+}
+
+export function setAccessToken(token) {
+  if (token) window.localStorage.setItem(TOKEN_KEY, token)
+  else window.localStorage.removeItem(TOKEN_KEY)
+}
+
+function authorizedHeaders(headers = {}) {
+  const token = getAccessToken()
+  return {
+    ...headers,
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  }
+}
+
 async function parseResponse(response) {
   let body
   try {
@@ -44,10 +63,10 @@ export async function fetchChatConfig() {
 export async function sendChatMessage({ content, sessionId }) {
   const response = await fetch('/api/v1/chat', {
     method: 'POST',
-    headers: {
+    headers: authorizedHeaders({
       'Content-Type': 'application/json',
       Accept: 'application/json',
-    },
+    }),
     body: JSON.stringify({ content, session_id: sessionId ?? null }),
   })
   return parseResponse(response)
@@ -64,15 +83,26 @@ export async function sendChatMessage({ content, sessionId }) {
 export async function streamChat({ content, sessionId, mode }, handlers) {
   const response = await fetch('/api/v1/chat/stream', {
     method: 'POST',
-    headers: {
+    headers: authorizedHeaders({
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
-    },
+    }),
     body: JSON.stringify({ content, session_id: sessionId ?? null, mode: mode ?? 'auto' }),
   })
 
   if (!response.ok) {
-    return { ok: false, error: `请求失败（HTTP ${response.status}）` }
+    let body = null
+    try {
+      body = await response.json()
+    } catch {
+      /* ignore */
+    }
+    return {
+      ok: false,
+      error: body?.message ?? `请求失败（HTTP ${response.status}）`,
+      code: body?.code ?? 'HTTP_ERROR',
+      status: response.status,
+    }
   }
 
   const reader = response.body.getReader()
@@ -127,14 +157,14 @@ export async function streamChat({ content, sessionId, mode }, handlers) {
 
 export async function listSessions() {
   const response = await fetch('/api/v1/sessions', {
-    headers: { Accept: 'application/json' },
+    headers: authorizedHeaders({ Accept: 'application/json' }),
   })
   return parseResponse(response)
 }
 
 export async function getSessionMessages(sessionId) {
   const response = await fetch(`/api/v1/sessions/${sessionId}`, {
-    headers: { Accept: 'application/json' },
+    headers: authorizedHeaders({ Accept: 'application/json' }),
   })
   return parseResponse(response)
 }
@@ -142,7 +172,7 @@ export async function getSessionMessages(sessionId) {
 export async function deleteSession(sessionId) {
   const response = await fetch(`/api/v1/sessions/${sessionId}`, {
     method: 'DELETE',
-    headers: { Accept: 'application/json' },
+    headers: authorizedHeaders({ Accept: 'application/json' }),
   })
   return parseResponse(response)
 }
@@ -156,10 +186,10 @@ export async function sendHandoff({
 }) {
   const response = await fetch('/api/v1/chat/handoff', {
     method: 'POST',
-    headers: {
+    headers: authorizedHeaders({
       'Content-Type': 'application/json',
       Accept: 'application/json',
-    },
+    }),
     body: JSON.stringify({
       session_id: sessionId ?? null,
       contact_name: contactName,
@@ -175,14 +205,14 @@ export async function sendHandoff({
 
 export async function listKnowledgeDocs() {
   const response = await fetch('/api/v1/knowledge/docs', {
-    headers: { Accept: 'application/json' },
+    headers: authorizedHeaders({ Accept: 'application/json' }),
   })
   return parseResponse(response)
 }
 
 export async function getKnowledgeDoc(name) {
   const response = await fetch(`/api/v1/knowledge/docs/${encodeURIComponent(name)}`, {
-    headers: { Accept: 'application/json' },
+    headers: authorizedHeaders({ Accept: 'application/json' }),
   })
   return parseResponse(response)
 }
@@ -190,10 +220,10 @@ export async function getKnowledgeDoc(name) {
 export async function importKnowledgeDoc(filename, content) {
   const response = await fetch('/api/v1/knowledge/docs', {
     method: 'POST',
-    headers: {
+    headers: authorizedHeaders({
       'Content-Type': 'application/json',
       Accept: 'application/json',
-    },
+    }),
     body: JSON.stringify({ filename, content }),
   })
   return parseResponse(response)
@@ -202,7 +232,7 @@ export async function importKnowledgeDoc(filename, content) {
 export async function deleteKnowledgeDoc(name) {
   const response = await fetch(`/api/v1/knowledge/docs/${encodeURIComponent(name)}`, {
     method: 'DELETE',
-    headers: { Accept: 'application/json' },
+    headers: authorizedHeaders({ Accept: 'application/json' }),
   })
   return parseResponse(response)
 }
@@ -210,11 +240,68 @@ export async function deleteKnowledgeDoc(name) {
 export async function searchKnowledge({ query, doc, k = 5 }) {
   const response = await fetch('/api/v1/knowledge/retrieve', {
     method: 'POST',
-    headers: {
+    headers: authorizedHeaders({
       'Content-Type': 'application/json',
       Accept: 'application/json',
-    },
+    }),
     body: JSON.stringify({ query, doc: doc ?? null, k }),
+  })
+  return parseResponse(response)
+}
+
+// ============ 用户认证与审批 ============
+
+export async function registerUser(username, password) {
+  const response = await fetch('/api/v1/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ username, password }),
+  })
+  return parseResponse(response)
+}
+
+export async function loginUser(username, password) {
+  const response = await fetch('/api/v1/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ username, password }),
+  })
+  const data = await parseResponse(response)
+  setAccessToken(data.access_token)
+  return data
+}
+
+export async function fetchCurrentUser() {
+  const response = await fetch('/api/v1/auth/me', {
+    headers: authorizedHeaders({ Accept: 'application/json' }),
+  })
+  return parseResponse(response)
+}
+
+export async function logoutUser() {
+  try {
+    const response = await fetch('/api/v1/auth/logout', {
+      method: 'POST',
+      headers: authorizedHeaders({ Accept: 'application/json' }),
+    })
+    await parseResponse(response)
+  } finally {
+    setAccessToken('')
+  }
+}
+
+export async function listUsers(status = '') {
+  const query = status ? `?status_filter=${encodeURIComponent(status)}` : ''
+  const response = await fetch(`/api/v1/admin/users${query}`, {
+    headers: authorizedHeaders({ Accept: 'application/json' }),
+  })
+  return parseResponse(response)
+}
+
+export async function reviewUser(userId, action) {
+  const response = await fetch(`/api/v1/admin/users/${userId}/${action}`, {
+    method: 'POST',
+    headers: authorizedHeaders({ Accept: 'application/json' }),
   })
   return parseResponse(response)
 }

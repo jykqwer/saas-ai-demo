@@ -2,10 +2,10 @@ apiVersion: v1
 kind: Service
 metadata:
   name: backend-service
-  namespace: saas-ai
+  namespace: saas-ai-demo
 spec:
   selector:
-    app: saas-ai
+    app: saas-ai-demo
     component: backend
   ports:
     - name: http

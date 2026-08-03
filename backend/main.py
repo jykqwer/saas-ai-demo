@@ -14,6 +14,10 @@ from core.logging import APP_LOGGER_NAME, configure_logging, get_logger
 from core.request_id import RequestIdMiddleware
 from core.request_logging import RequestLoggingMiddleware
 from domain.chat import build_assistant_profile, build_mock_reply
+from infrastructure.auth_repository import (
+    EphemeralAuthRepository,
+    SqlAlchemyAuthRepository,
+)
 from infrastructure.chat_repository import (
     EphemeralChatRepository,
     SqlAlchemyChatRepository,
@@ -27,6 +31,18 @@ from infrastructure.web_search import WebSearchClient
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """进程生命周期钩子：释放 LLM 客户端、数据库连接池与搜索客户端。"""
 
+    settings = app.state.settings
+    if (
+        settings.auth_enabled
+        and settings.bootstrap_superuser_username
+        and settings.bootstrap_superuser_password
+    ):
+        from core.security import hash_password
+
+        await app.state.auth_repository.ensure_superuser(
+            username=settings.bootstrap_superuser_username.strip().lower(),
+            password_hash=hash_password(settings.bootstrap_superuser_password),
+        )
     yield
     llm_client = getattr(app.state, "llm_client", None)
     if llm_client is not None:
@@ -85,9 +101,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.rag = None
 
     # 网络搜索：Tavily 必须配置 Key；缺失时不暴露工具，避免静默返回空结果。
-    tavily_ready = (
-        resolved_settings.web_search_provider != "tavily"
-        or bool(resolved_settings.tavily_api_key)
+    tavily_ready = resolved_settings.web_search_provider != "tavily" or bool(
+        resolved_settings.tavily_api_key
     )
     if resolved_settings.web_search_enabled and tavily_ready:
         app.state.web_search = WebSearchClient(
@@ -111,9 +126,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.chat_repository = SqlAlchemyChatRepository(
             database.session_factory_any
         )
+        app.state.auth_repository = SqlAlchemyAuthRepository(
+            database.session_factory_any
+        )
     else:
         app.state.database = None
         app.state.chat_repository = EphemeralChatRepository()
+        app.state.auth_repository = EphemeralAuthRepository()
 
     if resolved_settings.cors_origins:
         app.add_middleware(

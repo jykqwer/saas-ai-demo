@@ -7,8 +7,9 @@
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-DEFAULT_APP_NAME = "SaaS AI Assistant API"
+DEFAULT_APP_NAME = "saas-ai-demo API"
 DEFAULT_ENVIRONMENT = "local"
 DEFAULT_LOG_LEVEL = "INFO"
 VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
@@ -22,6 +23,9 @@ DEFAULT_LLM_MAX_CONTEXT_TURNS = 12
 DEFAULT_SAAS_PRODUCT_NAME = "云枢 CloudHub"
 DEFAULT_SAAS_COMPANY_NAME = "云枢科技"
 DEFAULT_DATABASE_HEALTH_TIMEOUT_SECONDS = 2.0
+DEFAULT_USER_DAILY_QUESTION_LIMIT = 10
+DEFAULT_AUTH_SESSION_TTL_HOURS = 24
+DEFAULT_QUOTA_TIMEZONE = "Asia/Shanghai"
 
 
 def _parse_origins(raw_origins: str | None) -> tuple[str, ...]:
@@ -90,6 +94,14 @@ class Settings:
     database_url: str | None = None
     database_health_timeout_seconds: float = DEFAULT_DATABASE_HEALTH_TIMEOUT_SECONDS
 
+    # 演示用户服务：注册需审批，普通用户按自然日限额，superuser 不限额。
+    auth_enabled: bool = True
+    auth_session_ttl_hours: int = DEFAULT_AUTH_SESSION_TTL_HOURS
+    user_daily_question_limit: int = DEFAULT_USER_DAILY_QUESTION_LIMIT
+    quota_timezone: str = DEFAULT_QUOTA_TIMEZONE
+    bootstrap_superuser_username: str | None = None
+    bootstrap_superuser_password: str | None = None
+
     # RAG：对知识库 Markdown 文档做本地检索，注入回答上下文。
     rag_enabled: bool = True
     rag_top_k: int = 3
@@ -131,6 +143,30 @@ class Settings:
             raise ValueError("DATABASE_URL must use the postgresql+psycopg scheme")
         if self.database_health_timeout_seconds <= 0:
             raise ValueError("DATABASE_HEALTH_TIMEOUT_SECONDS must be positive")
+        if self.auth_session_ttl_hours <= 0:
+            raise ValueError("AUTH_SESSION_TTL_HOURS must be positive")
+        if self.user_daily_question_limit <= 0:
+            raise ValueError("USER_DAILY_QUESTION_LIMIT must be positive")
+        try:
+            ZoneInfo(self.quota_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("QUOTA_TIMEZONE must be a valid IANA timezone") from exc
+        bootstrap_values = (
+            self.bootstrap_superuser_username,
+            self.bootstrap_superuser_password,
+        )
+        if any(bootstrap_values) and not all(bootstrap_values):
+            raise ValueError(
+                "BOOTSTRAP_SUPERUSER_USERNAME and BOOTSTRAP_SUPERUSER_PASSWORD "
+                "must be configured together"
+            )
+        if (
+            self.bootstrap_superuser_password
+            and len(self.bootstrap_superuser_password) < 8
+        ):
+            raise ValueError(
+                "BOOTSTRAP_SUPERUSER_PASSWORD must contain at least 8 characters"
+            )
 
         # 配置了 Key 时必须同时给出合法的 HTTPS 端点。
         if self.llm_api_key:
@@ -159,7 +195,9 @@ def _build_settings() -> Settings:
         llm_base_url=os.getenv("LLM_BASE_URL", DEFAULT_LLM_BASE_URL).rstrip("/"),
         llm_model=os.getenv("LLM_MODEL", DEFAULT_LLM_MODEL),
         llm_timeout_seconds=_parse_float(
-            "LLM_TIMEOUT_SECONDS", os.getenv("LLM_TIMEOUT_SECONDS"), DEFAULT_LLM_TIMEOUT_SECONDS
+            "LLM_TIMEOUT_SECONDS",
+            os.getenv("LLM_TIMEOUT_SECONDS"),
+            DEFAULT_LLM_TIMEOUT_SECONDS,
         ),
         llm_max_context_turns=_parse_int(
             "LLM_MAX_CONTEXT_TURNS",
@@ -174,20 +212,32 @@ def _build_settings() -> Settings:
             os.getenv("DATABASE_HEALTH_TIMEOUT_SECONDS"),
             DEFAULT_DATABASE_HEALTH_TIMEOUT_SECONDS,
         ),
+        auth_enabled=_parse_bool("AUTH_ENABLED", os.getenv("AUTH_ENABLED"), True),
+        auth_session_ttl_hours=_parse_int(
+            "AUTH_SESSION_TTL_HOURS",
+            os.getenv("AUTH_SESSION_TTL_HOURS"),
+            DEFAULT_AUTH_SESSION_TTL_HOURS,
+        ),
+        user_daily_question_limit=_parse_int(
+            "USER_DAILY_QUESTION_LIMIT",
+            os.getenv("USER_DAILY_QUESTION_LIMIT"),
+            DEFAULT_USER_DAILY_QUESTION_LIMIT,
+        ),
+        quota_timezone=os.getenv("QUOTA_TIMEZONE", DEFAULT_QUOTA_TIMEZONE),
+        bootstrap_superuser_username=(
+            os.getenv("BOOTSTRAP_SUPERUSER_USERNAME") or None
+        ),
+        bootstrap_superuser_password=(
+            os.getenv("BOOTSTRAP_SUPERUSER_PASSWORD") or None
+        ),
         rag_enabled=_parse_bool("RAG_ENABLED", os.getenv("RAG_ENABLED"), True),
         rag_top_k=_parse_int("RAG_TOP_K", os.getenv("RAG_TOP_K"), 3),
-        rag_min_score=_parse_float(
-            "RAG_MIN_SCORE", os.getenv("RAG_MIN_SCORE"), 1.0
-        ),
-        rag_knowledge_base_dir=os.getenv(
-            "RAG_KNOWLEDGE_BASE_DIR", "knowledge_base"
-        ),
+        rag_min_score=_parse_float("RAG_MIN_SCORE", os.getenv("RAG_MIN_SCORE"), 1.0),
+        rag_knowledge_base_dir=os.getenv("RAG_KNOWLEDGE_BASE_DIR", "knowledge_base"),
         web_search_enabled=_parse_bool(
             "WEB_SEARCH_ENABLED", os.getenv("WEB_SEARCH_ENABLED"), True
         ),
-        web_search_provider=os.getenv(
-            "WEB_SEARCH_PROVIDER", "tavily"
-        ),
+        web_search_provider=os.getenv("WEB_SEARCH_PROVIDER", "tavily"),
         tavily_api_key=os.getenv("TAVILY_API_KEY") or None,
         web_search_max_results=_parse_int(
             "WEB_SEARCH_MAX_RESULTS", os.getenv("WEB_SEARCH_MAX_RESULTS"), 5

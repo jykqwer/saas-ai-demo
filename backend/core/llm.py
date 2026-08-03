@@ -43,11 +43,16 @@ class LLMResult:
 
 @dataclass(frozen=True, slots=True)
 class LLMToolCall:
-    """模型请求的一次工具调用。"""
+    """模型请求的一次工具调用。
+
+    reasoning_content：推理型模型（如 deepseek-v4-flash）在同一条响应里产出的
+    思考内容，工具调用被回传时必须一并带上，否则上游会 400。
+    """
 
     id: str
     name: str
     arguments: str
+    reasoning_content: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +272,7 @@ class LLMClient:
             payload["tools"] = tools
 
         tool_calls: dict[int, dict[str, str]] = {}
+        reasoning_parts: list[str] = []
         try:
             async with self._http.stream(
                 "POST",
@@ -303,6 +309,10 @@ class LLMClient:
                     content = delta.get("content")
                     if content:
                         yield StreamEvent(kind="delta", text=content)
+                    # 推理型模型的思考内容：需要随工具调用一并回传。
+                    reasoning = delta.get("reasoning_content")
+                    if reasoning:
+                        reasoning_parts.append(reasoning)
                     for tool_call in delta.get("tool_calls") or []:
                         idx = int(tool_call.get("index", 0))
                         entry = tool_calls.setdefault(
@@ -344,15 +354,21 @@ class LLMClient:
         )
 
         if tool_calls:
-            first = tool_calls[min(tool_calls)]
-            yield StreamEvent(
-                kind="tool_call",
-                tool_call=LLMToolCall(
-                    id=first["id"],
-                    name=first["name"],
-                    arguments=first["arguments"],
-                ),
-            )
+            reasoning = "".join(reasoning_parts)
+            # 同一响应可能包含多个工具调用（如同时检索知识库与联网），逐个下发。
+            for idx in sorted(tool_calls):
+                entry = tool_calls[idx]
+                if not entry["id"] or not entry["name"]:
+                    continue
+                yield StreamEvent(
+                    kind="tool_call",
+                    tool_call=LLMToolCall(
+                        id=entry["id"],
+                        name=entry["name"],
+                        arguments=entry["arguments"],
+                        reasoning_content=reasoning,
+                    ),
+                )
 
     def _mock_chat(
         self,

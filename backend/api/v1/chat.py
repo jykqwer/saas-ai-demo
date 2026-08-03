@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.errors import ApiError
-from core.llm import ChatProviderError
+from core.llm import ChatProviderError, LLMToolCall
 from domain.chat import (
     MAX_MESSAGE_CHARS,
     RETRIEVE_KB_TOOL,
@@ -389,8 +389,9 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                 )
 
             # 工具循环：auto 模式下模型可请求检索知识库或联网，执行后基于结果作答。
+            # 同一条响应可能包含多个工具调用（如同时检索知识库+联网），逐个执行。
             for _round in range(2):
-                tool_call_event = None
+                tool_calls: list[LLMToolCall] = []
                 async for event in llm.stream_round(
                     messages=turns,
                     request_id=request_id,
@@ -400,88 +401,97 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                     if event.kind == "delta":
                         buffer.append(event.text)
                         yield _sse({"type": "delta", "text": event.text})
-                    elif event.kind == "tool_call":
-                        tool_call_event = event
+                    elif event.kind == "tool_call" and event.tool_call is not None:
+                        tool_calls.append(event.tool_call)
 
-                if tool_call_event is None or tool_call_event.tool_call is None:
+                if not tool_calls:
                     break
 
-                tool_call = tool_call_event.tool_call
-                try:
-                    arguments = json.loads(tool_call.arguments or "{}")
-                except json.JSONDecodeError:
-                    arguments = {}
-                query = str(arguments.get("query", "")).strip()
+                # 推理型模型的思考内容必须随工具调用回传，否则上游返回 400。
+                reasoning_content = tool_calls[0].reasoning_content
+                assistant_tool_calls: list[dict] = []
+                tool_results: list[dict] = []
 
-                if tool_call.name == "web_search":
-                    tool_used = True
-                    results = await web_search.search(query) if query else []
-                    web_count = len(results)
-                    used_web_meta = [
-                        {"title": r.title, "url": r.url, "snippet": r.snippet}
-                        for r in results
-                    ]
-                    web_query = query
-                    yield _sse(
-                        {
-                            "type": "search",
-                            "query": query,
-                            "results": [
-                                {
-                                    "title": r.title,
-                                    "url": r.url,
-                                    "snippet": r.snippet,
-                                }
-                                for r in results
-                            ],
-                        }
-                    )
-                    tool_content = format_web_results(results)
-                elif tool_call.name == "retrieve_knowledge_base":
-                    # 知识库按需检索：只有模型判定为产品问题时才执行并展示来源。
-                    chunks = rag.retrieve(query) if rag is not None else []
-                    rag_count = len(chunks)
-                    used_rag_meta = [
-                        {
-                            "source": c.source,
-                            "heading": c.heading,
-                            "score": round(c.score, 3),
-                        }
-                        for c in chunks
-                    ]
-                    yield _sse(
-                        {
-                            "type": "rag_used",
-                            "rag": used_rag_meta,
-                        }
-                    )
-                    tool_content = format_rag_tool_results(chunks)
-                else:
-                    break
+                for tool_call in tool_calls:
+                    try:
+                        arguments = json.loads(tool_call.arguments or "{}")
+                    except json.JSONDecodeError:
+                        arguments = {}
+                    query = str(arguments.get("query", "")).strip()
 
-                # 追加助手工具调用与工具结果，进入第二轮生成最终回答。
-                turns = [
-                    *turns,
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [
+                    if tool_call.name == "web_search":
+                        tool_used = True
+                        results = (
+                            await web_search.search(query)
+                            if web_search is not None and query
+                            else []
+                        )
+                        web_count = len(results)
+                        used_web_meta = [
+                            {"title": r.title, "url": r.url, "snippet": r.snippet}
+                            for r in results
+                        ]
+                        web_query = query
+                        yield _sse(
                             {
-                                "id": tool_call.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tool_call.name,
-                                    "arguments": tool_call.arguments,
-                                },
+                                "type": "search",
+                                "query": query,
+                                "results": used_web_meta,
                             }
-                        ],
-                    },
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": tool_content,
-                    },
-                ]
+                        )
+                        tool_content = format_web_results(results)
+                    elif tool_call.name == "retrieve_knowledge_base":
+                        # 知识库按需检索：只有模型判定为产品问题时才执行并展示来源。
+                        chunks = (
+                            rag.retrieve(query)
+                            if rag is not None and query
+                            else []
+                        )
+                        rag_count = len(chunks)
+                        used_rag_meta = [
+                            {
+                                "source": c.source,
+                                "heading": c.heading,
+                                "score": round(c.score, 3),
+                            }
+                            for c in chunks
+                        ]
+                        yield _sse({"type": "rag_used", "rag": used_rag_meta})
+                        tool_content = format_rag_tool_results(chunks)
+                    else:
+                        # 未知工具：不执行，也不回传。
+                        continue
+
+                    assistant_tool_calls.append(
+                        {
+                            "id": tool_call.id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_call.name,
+                                "arguments": tool_call.arguments,
+                            },
+                        }
+                    )
+                    tool_results.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": tool_content,
+                        }
+                    )
+
+                if not assistant_tool_calls:
+                    break
+
+                # 追加助手工具调用（含思考内容）与全部工具结果，进入第二轮生成最终回答。
+                assistant_msg: dict = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": assistant_tool_calls,
+                }
+                if reasoning_content:
+                    assistant_msg["reasoning_content"] = reasoning_content
+                turns = [*turns, assistant_msg, *tool_results]
                 tools = None  # 第二轮不再给工具，避免死循环
 
             reply = "".join(buffer)

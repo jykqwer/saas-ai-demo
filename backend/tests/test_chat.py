@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from core.config import Settings
-from core.llm import StreamEvent
+from core.llm import LLMToolCall, StreamEvent
 from domain.chat import RETRIEVE_KB_TOOL, WEB_SEARCH_TOOL
 from main import create_app
 
@@ -201,6 +201,78 @@ def test_auto_mode_tools_disabled_web_keeps_rag() -> None:
     # 只应下发知识库检索工具，不应依赖联网开关。
     assert recorded["tools"] == [RETRIEVE_KB_TOOL]
     assert WEB_SEARCH_TOOL not in recorded["tools"]
+
+
+def test_tool_loop_echoes_reasoning_content() -> None:
+    """工具循环应把推理模型的思考内容随工具调用回传，并执行同轮多个工具。"""
+
+    settings = Settings(
+        app_name="Test SaaS AI Assistant API",
+        environment="test",
+        log_level="CRITICAL",
+        llm_api_key="sk-test",
+        llm_base_url="https://api.deepseek.com",
+        llm_model="deepseek-chat",
+    )
+    app = create_app(settings)
+    seen_messages: list[list[dict]] = []
+
+    class _FakeLLM:
+        configured = True
+        model = "deepseek-chat"
+        provider = "fake"
+
+        async def close(self) -> None:
+            pass
+
+        async def stream_round(
+            self, *, messages, request_id, tools=None, rag_chunks=None
+        ):
+            seen_messages.append(messages)
+            if tools:
+                # 第一轮：同一条响应里同时请求知识库检索与联网。
+                yield StreamEvent(
+                    kind="tool_call",
+                    tool_call=LLMToolCall(
+                        id="call_1",
+                        name="retrieve_knowledge_base",
+                        arguments='{"query": "标准版多少钱"}',
+                        reasoning_content="用户询问价格，需要检索知识库",
+                    ),
+                )
+                yield StreamEvent(
+                    kind="tool_call",
+                    tool_call=LLMToolCall(
+                        id="call_2",
+                        name="web_search",
+                        arguments='{"query": "云枢 CloudHub"}',
+                        reasoning_content="用户询问价格，需要检索知识库",
+                    ),
+                )
+            else:
+                # 第二轮：基于工具结果生成回答。
+                yield StreamEvent(kind="delta", text="标准版 99 元起")
+
+    app.state.llm_client = _FakeLLM()
+    with TestClient(app) as c:
+        response = c.post(
+            "/api/v1/chat/stream",
+            json={"content": "标准版多少钱", "mode": "auto"},
+        )
+        assert response.status_code == 200
+        # 两个工具都被执行并回传对应事件。
+        assert '"type": "rag_used"' in response.text
+        assert '"type": "search"' in response.text
+
+    round2 = seen_messages[-1]
+    assistant = round2[-3]  # [system, user, assistant, tool, tool]
+    assert assistant["role"] == "assistant"
+    names = [tc["function"]["name"] for tc in assistant["tool_calls"]]
+    assert names == ["retrieve_knowledge_base", "web_search"]
+    assert assistant["reasoning_content"] == "用户询问价格，需要检索知识库"
+    # 每个工具调用都有对应的 tool 结果。
+    tool_msgs = [m for m in round2 if m["role"] == "tool"]
+    assert len(tool_msgs) == 2
 
 
 def test_handoff_creates_ticket(client: TestClient) -> None:

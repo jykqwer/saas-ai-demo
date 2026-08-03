@@ -208,6 +208,17 @@ export default function ChatPage() {
               return next
             })
           },
+          onRagUsed: (payload) => {
+            // 记录本轮实际采用的知识库来源（模型调用检索工具后返回）。
+            setMessages((prev) => {
+              const next = [...prev]
+              const last = next[next.length - 1]
+              if (last?.role === 'assistant' && last.streaming) {
+                next[next.length - 1] = { ...last, ragSources: payload.rag ?? [] }
+              }
+              return next
+            })
+          },
           onError: (payload) => {
             setError(
               payload.code === 'LLM_UPSTREAM_ERROR' ||

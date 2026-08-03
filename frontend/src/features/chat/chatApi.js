@@ -83,6 +83,7 @@ export async function streamChat({ content, sessionId, mode }, handlers) {
     if (payload?.type === 'meta') handlers.onMeta?.(payload)
     else if (payload?.type === 'delta') handlers.onDelta?.(payload.text ?? '')
     else if (payload?.type === 'search') handlers.onSearch?.(payload)
+    else if (payload?.type === 'rag_used') handlers.onRagUsed?.(payload)
     else if (payload?.type === 'done') handlers.onDone?.(payload)
     else if (payload?.type === 'error') handlers.onError?.(payload)
   }

@@ -5,9 +5,11 @@
 export default function ChatMessage({ message, onOpenSource }) {
   const isUser = message.role === 'user'
   const isTyping = message.streaming && !message.content
-  // 联网回答时，知识库参考多为无关噪音，隐藏；只展示网络来源。
-  const showRagSources = !message.webSearch && message.ragSources?.length > 0
+  // 只展示“本轮实际采用的来源”：ragSources 由模型调用检索工具后写入，
+  // 不再是无条件预检索的候选，因此可与联网来源并列展示。
+  const showRagSources = message.ragSources?.length > 0
   const showWebSources = message.webResults?.length > 0
+  const webCountLabel = showWebSources ? `（${message.webResults.length} 条结果）` : ''
 
   const renderBold = (text) => {
     const parts = text.split(/(\*\*[^*]+\*\*)/g)
@@ -27,7 +29,7 @@ export default function ChatMessage({ message, onOpenSource }) {
       <div className="msg-body">
         {message.webSearch && !isUser && (
           <div className="web-badge">
-            🌐 已联网查询「{message.webSearch}」{showWebSources ? `（${message.webResults.length} 条结果）` : ''}
+            🌐 已联网查询「{message.webSearch}」{webCountLabel}
           </div>
         )}
         <div className={`msg-bubble ${message.streaming ? 'streaming' : ''}`}>

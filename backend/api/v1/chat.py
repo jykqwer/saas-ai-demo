@@ -12,11 +12,13 @@ from core.errors import ApiError
 from core.llm import ChatProviderError
 from domain.chat import (
     MAX_MESSAGE_CHARS,
+    RETRIEVE_KB_TOOL,
     WEB_SEARCH_TOOL,
     AssistantProfile,
     build_assistant_profile,
     build_system_prompt,
     format_rag_context,
+    format_rag_tool_results,
     format_web_context,
     format_web_results,
 )
@@ -121,25 +123,20 @@ def _rag_engine(request: Request):
     return getattr(request.app.state, "rag", None)
 
 
-def _build_system_prompt(request: Request, content: str) -> str:
+def _build_system_prompt(
+    request: Request, content: str, chunks: list | None = None
+) -> str:
     settings = request.app.state.settings
     prompt = build_system_prompt(
         product_name=settings.saas_product_name,
         company_name=settings.saas_company_name,
     )
-    # 检索知识库并追加参考资料；无命中则保持原提示词。
-    rag = _rag_engine(request)
-    if rag is not None:
-        chunks = rag.retrieve(content)
-        prompt += format_rag_context(chunks)
+    # 追加知识库参考资料；chunks 为 None 时现场检索（无预检索的场景兜底）。
+    if chunks is None:
+        rag = _rag_engine(request)
+        chunks = rag.retrieve(content) if rag is not None else []
+    prompt += format_rag_context(chunks)
     return prompt
-
-
-def _retrieve_chunks(request: Request, content: str) -> list:
-    rag = _rag_engine(request)
-    if rag is None:
-        return []
-    return rag.retrieve(content)
 
 
 async def _resolve_session(request: Request, session_id: UUID | None, content: str):
@@ -159,16 +156,28 @@ async def _resolve_session(request: Request, session_id: UUID | None, content: s
 
 
 async def _build_turns(
-    request: Request, session_id: UUID, content: str
+    request: Request,
+    session_id: UUID,
+    content: str,
+    *,
+    pre_inject_rag: bool = True,
 ) -> tuple[list[dict], list]:
-    """加载最近上下文并追加当前用户消息，构造带系统提示词与 RAG 上下文的输入。"""
+    """加载最近上下文并追加当前用户消息，构造带系统提示词与 RAG 上下文的输入。
+
+    只检索一次知识库：结果同时用于系统提示词注入与返回的 rag_chunks。
+    pre_inject_rag=False（真实自动模式）时不预注入，改由模型调用
+    retrieve_knowledge_base 工具按需检索，避免无关问题污染上下文。
+    """
 
     settings = request.app.state.settings
     repo = _repository(request)
     history = await repo.list_messages(session_id=session_id)
 
-    rag_chunks = _retrieve_chunks(request, content)
-    system_prompt = _build_system_prompt(request, content)
+    rag = _rag_engine(request)
+    rag_chunks = (
+        rag.retrieve(content) if (rag is not None and pre_inject_rag) else []
+    )
+    system_prompt = _build_system_prompt(request, content, chunks=rag_chunks)
 
     turns: list[dict] = [{"role": "system", "content": system_prompt}]
     # 保留最近 N 轮（2N 条消息），避免请求体无界增长。
@@ -263,10 +272,20 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
             await _persist(
                 request, session_id=session.id, role="user", content=body.content
             )
-            turns, rag_chunks = await _build_turns(request, session.id, body.content)
 
             mode = body.mode or "auto"
             web_search = getattr(request.app.state, "web_search", None)
+            rag = _rag_engine(request)
+
+            # 预注入知识库的条件：演示模式（无工具循环）以及 knowledge/web 模式。
+            # 真实自动模式下不预注入，改由模型调用 retrieve_knowledge_base 按需检索。
+            pre_inject_rag = (not llm.configured) or mode in ("knowledge", "web")
+            turns, rag_chunks = await _build_turns(
+                request,
+                session.id,
+                body.content,
+                pre_inject_rag=pre_inject_rag,
+            )
 
             # 模式提示词：明确约束模型行为。
             mode_note = {
@@ -306,14 +325,15 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
             tools = None
             tool_used = False
             web_count = 0
+            rag_count = len(rag_chunks)
             buffer: list[str] = []
 
             # 模式分支：
-            # - knowledge：不联网、不传工具
+            # - knowledge：不联网、不传工具（知识库已预注入）
             # - web：无条件检索并注入上下文，再作答（不传工具）
-            # - auto：传工具，由模型决定是否联网
+            # - auto：传知识库检索 + 联网两个工具，由模型按需决策
             if mode == "auto" and web_search is not None:
-                tools = [WEB_SEARCH_TOOL]
+                tools = [RETRIEVE_KB_TOOL, WEB_SEARCH_TOOL]
             elif mode == "web" and web_search is not None:
                 results = await web_search.search(body.content)
                 web_count = len(results)
@@ -333,7 +353,7 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                     }
                 )
 
-            # 工具循环：auto 模式下模型可先请求 web_search，执行后基于结果作答。
+            # 工具循环：auto 模式下模型可请求检索知识库或联网，执行后基于结果作答。
             for _round in range(2):
                 tool_call_event = None
                 async for event in llm.stream_round(
@@ -352,27 +372,51 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                     break
 
                 tool_call = tool_call_event.tool_call
-                if tool_call.name != "web_search":
-                    break
-                tool_used = True
                 try:
                     arguments = json.loads(tool_call.arguments or "{}")
                 except json.JSONDecodeError:
                     arguments = {}
                 query = str(arguments.get("query", "")).strip()
 
-                results = await web_search.search(query) if query else []
-                web_count = len(results)
-                yield _sse(
-                    {
-                        "type": "search",
-                        "query": query,
-                        "results": [
-                            {"title": r.title, "url": r.url, "snippet": r.snippet}
-                            for r in results
-                        ],
-                    }
-                )
+                if tool_call.name == "web_search":
+                    tool_used = True
+                    results = await web_search.search(query) if query else []
+                    web_count = len(results)
+                    yield _sse(
+                        {
+                            "type": "search",
+                            "query": query,
+                            "results": [
+                                {
+                                    "title": r.title,
+                                    "url": r.url,
+                                    "snippet": r.snippet,
+                                }
+                                for r in results
+                            ],
+                        }
+                    )
+                    tool_content = format_web_results(results)
+                elif tool_call.name == "retrieve_knowledge_base":
+                    # 知识库按需检索：只有模型判定为产品问题时才执行并展示来源。
+                    chunks = rag.retrieve(query) if rag is not None else []
+                    rag_count = len(chunks)
+                    yield _sse(
+                        {
+                            "type": "rag_used",
+                            "rag": [
+                                {
+                                    "source": c.source,
+                                    "heading": c.heading,
+                                    "score": round(c.score, 3),
+                                }
+                                for c in chunks
+                            ],
+                        }
+                    )
+                    tool_content = format_rag_tool_results(chunks)
+                else:
+                    break
 
                 # 追加助手工具调用与工具结果，进入第二轮生成最终回答。
                 turns = [
@@ -394,7 +438,7 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": format_web_results(results),
+                        "content": tool_content,
                     },
                 ]
                 tools = None  # 第二轮不再给工具，避免死循环
@@ -419,7 +463,7 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                     "mode": mode,
                     "web": tool_used or mode == "web",
                     "web_count": web_count,
-                    "rag_count": len(rag_chunks),
+                    "rag_count": rag_count,
                 }
             )
         except ChatProviderError as exc:

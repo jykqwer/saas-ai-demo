@@ -151,6 +151,38 @@ def format_web_results(results) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def format_rag_tool_results(chunks) -> str:
+    """把知识库检索分块格式化为工具返回给模型的 JSON 字符串。"""
+
+    payload = [
+        {"source": c.source, "heading": c.heading, "content": c.content}
+        for c in chunks
+    ]
+    return json.dumps(payload, ensure_ascii=False)
+
+
+RETRIEVE_KB_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "retrieve_knowledge_base",
+        "description": (
+            "在「云枢 CloudHub」产品知识库中检索相关资料。"
+            "当用户询问产品功能、价格、套餐、试用、私有化部署、数据安全、"
+            "API/集成、常见售后等产品相关问题，需要引用内部资料作答时使用。"
+            "与实时/外部信息无关的产品问题都应先检索知识库。"
+            "参数 query 是检索关键词（通常可直接使用用户的提问）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "知识库检索关键词"}
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
 def format_web_context(results) -> str:
     """把网络搜索结果格式化为注入系统提示词的参考资料段落（始终联网模式用）。"""
 

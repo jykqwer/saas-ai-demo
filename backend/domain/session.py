@@ -46,6 +46,8 @@ class StoredMessage(BaseModel):
     provider: str | None = None
     model: str | None = None
     mock: bool = False
+    # 助手消息采用的来源（{"rag": [...], "web": [...], "web_query": "..."}）
+    sources: dict | None = None
     created_at: datetime
 
 
@@ -93,6 +95,7 @@ class ChatRepository(Protocol):
         provider: str | None = None,
         model: str | None = None,
         mock: bool = False,
+        sources: dict | None = None,
     ) -> StoredMessage: ...
 
     async def list_messages(

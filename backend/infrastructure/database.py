@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     DateTime,
     ForeignKey,
@@ -58,6 +59,8 @@ class ChatMessageRow(Base):
     provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     model: Mapped[str | None] = mapped_column(String(64), nullable=True)
     mock: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 助手消息采用的知识库/联网来源，JSON 格式：{"rag": [...], "web": [...], "web_query": "..."}
+    sources: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

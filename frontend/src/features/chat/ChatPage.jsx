@@ -100,17 +100,24 @@ export default function ChatPage() {
       try {
         const data = await getSessionMessages(sessionId)
         setMessages(
-          (data.messages ?? []).map((m) => ({
-            role: m.role,
-            content: m.content,
-            // 仅助手消息展示来源；用户消息不附加 meta。
-            meta:
-              m.role === 'assistant'
-                ? m.mock
-                  ? '演示模式 · 配置 LLM_API_KEY 后接入真实大模型'
-                  : `${m.provider ?? ''} · ${m.model ?? ''}`
-                : undefined,
-          })),
+          (data.messages ?? []).map((m) => {
+            const src = m.sources ?? null
+            return {
+              role: m.role,
+              content: m.content,
+              // 从持久化来源恢复展示（RAG/联网 chips 与链接）。
+              ragSources: src?.rag?.length ? src.rag : undefined,
+              webSearch: src?.web_query || undefined,
+              webResults: src?.web?.length ? src.web : undefined,
+              // 仅助手消息展示来源；用户消息不附加 meta。
+              meta:
+                m.role === 'assistant'
+                  ? m.mock
+                    ? '演示模式 · 配置 LLM_API_KEY 后接入真实大模型'
+                    : `${m.provider ?? ''} · ${m.model ?? ''}`
+                  : undefined,
+            }
+          }),
         )
         setSession(sessionId)
         setError('')

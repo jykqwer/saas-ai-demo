@@ -45,6 +45,7 @@ def _to_message(row: ChatMessageRow) -> StoredMessage:
         provider=row.provider,
         model=row.model,
         mock=row.mock,
+        sources=row.sources,
         created_at=row.created_at,
     )
 
@@ -117,6 +118,7 @@ class SqlAlchemyChatRepository:
         provider: str | None = None,
         model: str | None = None,
         mock: bool = False,
+        sources: dict | None = None,
     ) -> StoredMessage:
         async with self._session_factory() as session:
             row = ChatMessageRow(
@@ -126,6 +128,7 @@ class SqlAlchemyChatRepository:
                 provider=provider,
                 model=model,
                 mock=mock,
+                sources=sources,
             )
             session.add(row)
             await session.commit()
@@ -283,6 +286,7 @@ class EphemeralChatRepository:
         provider: str | None = None,
         model: str | None = None,
         mock: bool = False,
+        sources: dict | None = None,
     ) -> StoredMessage:
         message = StoredMessage(
             id=uuid4(),
@@ -292,6 +296,7 @@ class EphemeralChatRepository:
             provider=provider,
             model=model,
             mock=mock,
+            sources=sources,
             created_at=utcnow(),
         )
         async with self._lock:

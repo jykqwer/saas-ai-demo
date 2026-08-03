@@ -28,6 +28,7 @@ class MessageOut(BaseModel):
     provider: str | None = None
     model: str | None = None
     mock: bool = False
+    sources: dict | None = None
     created_at: datetime
 
 
@@ -59,6 +60,7 @@ def _message_out(message: StoredMessage) -> MessageOut:
         provider=message.provider,
         model=message.model,
         mock=message.mock,
+        sources=message.sources,
         created_at=message.created_at,
     )
 

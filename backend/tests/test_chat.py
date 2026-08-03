@@ -214,6 +214,25 @@ def test_delete_session(client: TestClient) -> None:
     assert client.get(f"/api/v1/sessions/{session_id}").status_code == 404
 
 
+def test_message_sources_persisted(client: TestClient) -> None:
+    """助手消息应把实际采用的知识库来源随会话持久化，供刷新后恢复。"""
+
+    response = client.post(
+        "/api/v1/chat",
+        json={"content": "私有化部署需要什么环境？"},
+    )
+    assert response.status_code == 200
+    session_id = response.json()["session_id"]
+
+    body = client.get(f"/api/v1/sessions/{session_id}").json()
+    assistant = [m for m in body["messages"] if m["role"] == "assistant"]
+    assert assistant
+    sources = assistant[-1]["sources"]
+    assert sources is not None
+    assert sources["rag"]
+    assert {"source", "heading", "score"} <= set(sources["rag"][0])
+
+
 def test_rag_config_reports_docs(client: TestClient) -> None:
     """config 应报告知识库已加载的文档数与分块数。"""
 

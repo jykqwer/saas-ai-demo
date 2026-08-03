@@ -196,6 +196,7 @@ async def _persist(
     provider: str | None = None,
     model: str | None = None,
     mock: bool = False,
+    sources: dict | None = None,
 ) -> None:
     repo = _repository(request)
     await repo.append_message(
@@ -205,6 +206,7 @@ async def _persist(
         provider=provider,
         model=model,
         mock=mock,
+        sources=sources,
     )
     await repo.touch_session(session_id=session_id)
 
@@ -243,6 +245,16 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
         provider=result.provider,
         model=result.model,
         mock=result.mock,
+        sources=(
+            {
+                "rag": [
+                    {"source": c.source, "heading": c.heading, "score": round(c.score, 3)}
+                    for c in rag_chunks
+                ]
+            }
+            if rag_chunks
+            else None
+        ),
     )
     return ChatResponse(
         reply=result.text,
@@ -326,6 +338,17 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
             tool_used = False
             web_count = 0
             rag_count = len(rag_chunks)
+            # 本轮实际采用的来源（供落库持久化，刷新会话后仍可展示）。
+            used_rag_meta: list[dict] = [
+                {
+                    "source": chunk.source,
+                    "heading": chunk.heading,
+                    "score": round(chunk.score, 3),
+                }
+                for chunk in rag_chunks
+            ]
+            used_web_meta: list[dict] = []
+            web_query: str | None = None
             buffer: list[str] = []
 
             # 模式分支：
@@ -337,6 +360,11 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
             elif mode == "web" and web_search is not None:
                 results = await web_search.search(body.content)
                 web_count = len(results)
+                used_web_meta = [
+                    {"title": r.title, "url": r.url, "snippet": r.snippet}
+                    for r in results
+                ]
+                web_query = body.content
                 if results:
                     turns[0] = {
                         **turns[0],
@@ -382,6 +410,11 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                     tool_used = True
                     results = await web_search.search(query) if query else []
                     web_count = len(results)
+                    used_web_meta = [
+                        {"title": r.title, "url": r.url, "snippet": r.snippet}
+                        for r in results
+                    ]
+                    web_query = query
                     yield _sse(
                         {
                             "type": "search",
@@ -401,17 +434,18 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                     # 知识库按需检索：只有模型判定为产品问题时才执行并展示来源。
                     chunks = rag.retrieve(query) if rag is not None else []
                     rag_count = len(chunks)
+                    used_rag_meta = [
+                        {
+                            "source": c.source,
+                            "heading": c.heading,
+                            "score": round(c.score, 3),
+                        }
+                        for c in chunks
+                    ]
                     yield _sse(
                         {
                             "type": "rag_used",
-                            "rag": [
-                                {
-                                    "source": c.source,
-                                    "heading": c.heading,
-                                    "score": round(c.score, 3),
-                                }
-                                for c in chunks
-                            ],
+                            "rag": used_rag_meta,
                         }
                     )
                     tool_content = format_rag_tool_results(chunks)
@@ -444,6 +478,16 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                 tools = None  # 第二轮不再给工具，避免死循环
 
             reply = "".join(buffer)
+            # 组装本轮实际采用的来源，随助手消息落库以便刷新后恢复展示。
+            sources: dict | None = None
+            if used_rag_meta or used_web_meta:
+                sources = {}
+                if used_rag_meta:
+                    sources["rag"] = used_rag_meta
+                if used_web_meta:
+                    sources["web"] = used_web_meta
+                    if web_query:
+                        sources["web_query"] = web_query
             await _persist(
                 request,
                 session_id=session.id,
@@ -452,6 +496,7 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                 provider=llm.provider,
                 model=llm.model,
                 mock=not llm.configured,
+                sources=sources,
             )
             yield _sse(
                 {

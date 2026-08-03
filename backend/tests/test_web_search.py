@@ -53,6 +53,31 @@ def test_duckduckgo_empty_returns_none() -> None:
         _run(client.close())
 
 
+def test_duckduckgo_filters_ad_links() -> None:
+    """广告/追踪链接（duckduckgo.com/y.js?ad_domain=...）不应被当作来源。"""
+
+    html_text = """
+    <html><body>
+    <a class="result__a" href="https://duckduckgo.com/y.js?ad_domain=artlist.io&amp;ad_provider=bingv7aa&amp;u3=https%3A%2F%2Fwww.bing.com%2Faclick%3Fld%3Dabc">
+      赞助商广告链接
+    </a>
+    <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Freal&rut=abc">
+      Real Result
+    </a>
+    </body></html>
+    """
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, text=html_text))
+    client = WebSearchClient(provider="duckduckgo", transport=transport)
+    try:
+        results = _run(client.search("测试"))
+    finally:
+        _run(client.close())
+
+    assert len(results) == 1
+    assert results[0].url == "https://example.com/real"
+    assert "duckduckgo.com" not in results[0].url
+
+
 def test_wikipedia_parsing() -> None:
     payload = {
         "query": {

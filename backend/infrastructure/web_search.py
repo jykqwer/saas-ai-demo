@@ -139,8 +139,15 @@ class WebSearchClient:
 
     @staticmethod
     def _decode_ddg_url(href: str) -> str:
-        """DDG 结果链接是重定向包装，取出真实 url。"""
+        """DDG 结果链接是重定向包装，取出真实 url；广告/追踪链接返回空串丢弃。
 
+        普通结果形如 //duckduckgo.com/l/?uddg=<真实URL>，取 uddg 即可。
+        广告结果是 https://duckduckgo.com/y.js?ad_domain=... 的跳转链接，
+        没有真实目标，直接丢弃，避免把广告当来源展示。
+        """
+
+        if "ad_domain=" in href or "y.js" in href:
+            return ""
         match = re.search(r"[?&]uddg=([^&]+)", href)
         if match:
             return unquote(match.group(1))

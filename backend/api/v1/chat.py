@@ -165,8 +165,8 @@ async def _build_turns(
     """加载最近上下文并追加当前用户消息，构造带系统提示词与 RAG 上下文的输入。
 
     只检索一次知识库：结果同时用于系统提示词注入与返回的 rag_chunks。
-    pre_inject_rag=False（真实自动模式）时不预注入，改由模型调用
-    retrieve_knowledge_base 工具按需检索，避免无关问题污染上下文。
+    pre_inject_rag=False（真实自动/始终联网模式）时不预注入：auto 由模型调用
+    retrieve_knowledge_base 工具按需检索，web 为纯联网，避免无关内容污染上下文。
     """
 
     settings = request.app.state.settings
@@ -289,9 +289,10 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
             web_search = getattr(request.app.state, "web_search", None)
             rag = _rag_engine(request)
 
-            # 预注入知识库的条件：演示模式（无工具循环）以及 knowledge/web 模式。
-            # 真实自动模式下不预注入，改由模型调用 retrieve_knowledge_base 按需检索。
-            pre_inject_rag = (not llm.configured) or mode in ("knowledge", "web")
+            # 预注入知识库的条件：演示模式（无工具循环）以及仅知识库模式。
+            # 真实自动/始终联网模式不预注入：auto 由模型调用 retrieve_knowledge_base
+            # 按需检索，web 为纯联网（只注入搜索结果）。
+            pre_inject_rag = (not llm.configured) or mode == "knowledge"
             turns, rag_chunks = await _build_turns(
                 request,
                 session.id,
@@ -353,7 +354,7 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
 
             # 模式分支：
             # - knowledge：不联网、不传工具（知识库已预注入）
-            # - web：无条件检索并注入上下文，再作答（不传工具）
+            # - web：不注入知识库，无条件联网检索并注入搜索结果，再作答（不传工具）
             # - auto：传知识库检索 + 联网两个工具，由模型按需决策
             if mode == "auto" and web_search is not None:
                 tools = [RETRIEVE_KB_TOOL, WEB_SEARCH_TOOL]

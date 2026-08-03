@@ -6,6 +6,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from core.config import Settings
+from core.llm import StreamEvent
+from domain.chat import RETRIEVE_KB_TOOL, WEB_SEARCH_TOOL
 from main import create_app
 
 
@@ -154,6 +156,51 @@ def test_stream_mock_reply(client: TestClient) -> None:
 
     history = client.get(f"/api/v1/sessions/{meta['session_id']}").json()
     assert len(history["messages"]) == 2
+
+
+def test_auto_mode_tools_disabled_web_keeps_rag() -> None:
+    """关闭联网但启用知识库时，auto 模式仍应把 RAG 检索工具交给模型。"""
+
+    settings = Settings(
+        app_name="Test SaaS AI Assistant API",
+        environment="test",
+        log_level="CRITICAL",
+        llm_api_key="sk-test",
+        llm_base_url="https://api.deepseek.com",
+        llm_model="deepseek-chat",
+        web_search_enabled=False,
+        rag_enabled=True,
+    )
+    app = create_app(settings)
+    recorded: dict = {}
+
+    class _FakeLLM:
+        configured = True
+        model = "deepseek-chat"
+        provider = "fake"
+
+        async def close(self) -> None:
+            pass
+
+        async def stream_round(
+            self, *, messages, request_id, tools=None, rag_chunks=None
+        ):
+            recorded["tools"] = tools
+            yield StreamEvent(kind="delta", text="ok")
+
+    app.state.llm_client = _FakeLLM()
+    with TestClient(app) as c:
+        response = c.post(
+            "/api/v1/chat/stream",
+            json={"content": "标准版多少钱", "mode": "auto"},
+        )
+        assert response.status_code == 200
+        # 消费完整 SSE，确保生成器执行到工具组装点。
+        assert "data: " in response.text
+
+    # 只应下发知识库检索工具，不应依赖联网开关。
+    assert recorded["tools"] == [RETRIEVE_KB_TOOL]
+    assert WEB_SEARCH_TOOL not in recorded["tools"]
 
 
 def test_handoff_creates_ticket(client: TestClient) -> None:

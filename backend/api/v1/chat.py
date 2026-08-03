@@ -355,9 +355,15 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
             # 模式分支：
             # - knowledge：不联网、不传工具（知识库已预注入）
             # - web：不注入知识库，无条件联网检索并注入搜索结果，再作答（不传工具）
-            # - auto：传知识库检索 + 联网两个工具，由模型按需决策
-            if mode == "auto" and web_search is not None:
-                tools = [RETRIEVE_KB_TOOL, WEB_SEARCH_TOOL]
+            # - auto：分别按可用能力组装知识库检索 + 联网工具，模型按需决策。
+            #   关闭联网不应让模型失去 RAG 工具，反之亦然。
+            if mode == "auto":
+                tools = []
+                if rag is not None:
+                    tools.append(RETRIEVE_KB_TOOL)
+                if web_search is not None:
+                    tools.append(WEB_SEARCH_TOOL)
+                tools = tools or None
             elif mode == "web" and web_search is not None:
                 results = await web_search.search(body.content)
                 web_count = len(results)

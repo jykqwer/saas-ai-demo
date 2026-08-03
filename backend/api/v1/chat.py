@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.errors import ApiError
-from core.llm import ChatProviderError, LLMToolCall
+from core.llm import ChatProviderError, LLMToolCall, strip_text_tool_calls
 from domain.chat import (
     MAX_MESSAGE_CHARS,
     RETRIEVE_KB_TOOL,
@@ -494,7 +494,7 @@ async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
                 turns = [*turns, assistant_msg, *tool_results]
                 tools = None  # 第二轮不再给工具，避免死循环
 
-            reply = "".join(buffer)
+            reply = strip_text_tool_calls("".join(buffer))
             # 组装本轮实际采用的来源，随助手消息落库以便刷新后恢复展示。
             sources: dict | None = None
             if used_rag_meta or used_web_meta:

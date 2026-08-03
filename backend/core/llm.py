@@ -11,6 +11,7 @@
 
 import asyncio
 import json
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -95,6 +96,43 @@ def _split_mock_chunks(text: str, max_chunk: int = 24) -> list[str]:
     if buffer:
         chunks.append(buffer)
     return chunks
+
+
+# 模型偶发把工具调用"写成文本"（而非结构化 tool_calls 字段）时的解析。
+# 这类文本不应作为回答展示，而应转成真正的工具调用执行。
+_TEXT_INVOKE_RE = re.compile(
+    r"<(?:antml:)?invoke\s+name=[\"'](?P<name>[^\"']+)[\"']>(?P<body>.*?)"
+    r"</(?:antml:)?invoke>",
+    re.DOTALL | re.IGNORECASE,
+)
+_TEXT_QUERY_PARAM_RE = re.compile(
+    r"<(?:antml:)?parameter\s+name=[\"']query[\"']>(?P<query>.*?)"
+    r"</(?:antml:)?parameter>",
+    re.DOTALL | re.IGNORECASE,
+)
+_KNOWN_TOOL_NAMES = {"web_search", "retrieve_knowledge_base"}
+_TEXT_TOOL_OPENINGS = ("<invoke", "<antml:invoke")
+
+
+def _is_text_tool_open(text: str) -> bool:
+    """待定内容是否可能是文本化工具调用的开头（是则暂挂等待完整块）。
+
+    两种情况都算"开头"：
+    - 待定文本是标记开头的增量前缀（如 "<"、 "<invoke"）；
+    - 待定文本已经包含完整未闭合的开标记（如 "<invoke name=...>"）。
+    """
+
+    t = text.lstrip().lower()
+    return any(
+        t.startswith(opening) or opening.startswith(t)
+        for opening in _TEXT_TOOL_OPENINGS
+    )
+
+
+def strip_text_tool_calls(text: str) -> str:
+    """从最终文本里剔除残留的工具调用标记（兜底清理）。"""
+
+    return _TEXT_INVOKE_RE.sub("", text).strip()
 
 
 class LLMClient:
@@ -273,6 +311,9 @@ class LLMClient:
 
         tool_calls: dict[int, dict[str, str]] = {}
         reasoning_parts: list[str] = []
+        # 暂挂可能属于"文本化工具调用"的内容，等待完整块或判定为普通文本。
+        pending: list[str] = []
+        text_call_index = 0
         try:
             async with self._http.stream(
                 "POST",
@@ -308,7 +349,50 @@ class LLMClient:
                     delta = choice.get("delta", {})
                     content = delta.get("content")
                     if content:
-                        yield StreamEvent(kind="delta", text=content)
+                        # 识别"写成文本"的工具调用：不把标记当回答流式输出，
+                        # 暂挂并转成真正的 tool_call 事件。
+                        pending.append(content)
+                        while True:
+                            joined = "".join(pending)
+                            match = _TEXT_INVOKE_RE.search(joined)
+                            if not match:
+                                break
+                            name = match.group("name").strip()
+                            if name in _KNOWN_TOOL_NAMES:
+                                prefix = joined[: match.start()]
+                                if prefix.strip():
+                                    yield StreamEvent(kind="delta", text=prefix)
+                                qm = _TEXT_QUERY_PARAM_RE.search(
+                                    match.group("body")
+                                )
+                                query = (
+                                    (qm.group("query").strip() if qm else "")
+                                    .strip('"')
+                                    .strip()
+                                )
+                                text_call_index += 1
+                                yield StreamEvent(
+                                    kind="tool_call",
+                                    tool_call=LLMToolCall(
+                                        id=f"text_call_{text_call_index}",
+                                        name=name,
+                                        arguments=json.dumps(
+                                            {"query": query},
+                                            ensure_ascii=False,
+                                        ),
+                                    ),
+                                )
+                                pending = [joined[match.end():]]
+                                continue
+                            # 未知工具名：整段按普通文本输出，避免吞掉内容。
+                            yield StreamEvent(kind="delta", text=joined)
+                            pending = []
+                            break
+                        if pending:
+                            pending_text = "".join(pending)
+                            if not _is_text_tool_open(pending_text):
+                                yield StreamEvent(kind="delta", text=pending_text)
+                                pending = []
                     # 推理型模型的思考内容：需要随工具调用一并回传。
                     reasoning = delta.get("reasoning_content")
                     if reasoning:

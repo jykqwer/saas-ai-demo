@@ -1,8 +1,10 @@
 """AI 客服/售前助手的聊天接口、流式输出与人工转接接口。"""
 
 import json
+from datetime import datetime
 from typing import Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Request, status
 from fastapi.responses import StreamingResponse
@@ -152,6 +154,8 @@ def _build_system_prompt(
     prompt = build_system_prompt(
         product_name=settings.saas_product_name,
         company_name=settings.saas_company_name,
+        timezone_name=settings.quota_timezone,
+        current_time=datetime.now(ZoneInfo(settings.quota_timezone)),
     )
     # 追加知识库参考资料；chunks 为 None 时现场检索（无预检索的场景兜底）。
     if chunks is None:
@@ -346,8 +350,8 @@ async def chat_stream(
             # 模式提示词：明确约束模型行为。
             mode_note = {
                 "knowledge": (
-                    "\n\n【当前模式：仅知识库】请只依据内部知识库回答；"
-                    "若知识库没有相关信息，如实说明不知道，不要编造或猜测实时信息。"
+                    "\n\n【当前模式：仅知识库】请只依据内部知识库和可信运行时上下文回答；"
+                    "若两者没有相关信息，如实说明不知道，不要编造或猜测实时信息。"
                 ),
                 "web": (
                     "\n\n【当前模式：始终联网】请优先使用提供的网络搜索结果回答最新/通用问题，"

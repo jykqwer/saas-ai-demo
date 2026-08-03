@@ -4,6 +4,8 @@ metadata:
   name: postgres-service
   namespace: saas-ai-demo
 spec:
+  # StatefulSet 只通过集群内稳定 DNS 访问数据库，不对集群外暴露端口。
+  clusterIP: None
   selector:
     app: saas-ai-demo
     component: postgres

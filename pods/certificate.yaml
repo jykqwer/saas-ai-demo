@@ -1,0 +1,14 @@
+# 复用集群中的 letsencrypt-prod ClusterIssuer，在新 namespace 独立保存证书。
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: zhaocaidog-tls
+  namespace: saas-ai-demo
+spec:
+  secretName: zhaocaidog-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+    - zhaocaidog.space
+    - www.zhaocaidog.space

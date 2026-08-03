@@ -1,0 +1,10 @@
+# Traefik 中间件属于 namespace；不能直接引用旧 demo namespace 中的对象。
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-to-https
+  namespace: saas-ai-demo
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true

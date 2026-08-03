@@ -1,0 +1,36 @@
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-www
+  namespace: saas-ai-demo
+spec:
+  redirectRegex:
+    regex: "^https?://www\\.zhaocaidog\\.space/(.*)"
+    replacement: "https://zhaocaidog.space/$1"
+    permanent: true
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: www-redirect
+  namespace: saas-ai-demo
+  annotations:
+    # HTTP 请求先升级到 HTTPS，下一次请求再跳转到不带 www 的规范域名。
+    traefik.ingress.kubernetes.io/router.middlewares: saas-ai-demo-redirect-to-https@kubernetescrd,saas-ai-demo-redirect-www@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - www.zhaocaidog.space
+      secretName: zhaocaidog-tls
+  rules:
+    - host: www.zhaocaidog.space
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port:
+                  number: 80

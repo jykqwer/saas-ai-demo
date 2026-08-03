@@ -84,7 +84,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         timeout_seconds=resolved_settings.llm_timeout_seconds,
         max_context_turns=resolved_settings.llm_max_context_turns,
         mock_reply=lambda question, rag_chunks: build_mock_reply(
-            question, assistant_profile, rag_chunks
+            question,
+            assistant_profile,
+            rag_chunks,
+            timezone_name=resolved_settings.quota_timezone,
         ),
     )
 

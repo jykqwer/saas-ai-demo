@@ -28,7 +28,7 @@ spec:
             - name: APP_ENV
               value: "production"
             - name: CORS_ALLOW_ORIGINS
-              value: "https://chat.example.com"
+              value: "https://zhaocaidog.space,https://www.zhaocaidog.space"
             - name: SAAS_PRODUCT_NAME
               value: "云枢 CloudHub"
             - name: SAAS_COMPANY_NAME

@@ -1,8 +1,9 @@
-"""轻量 RAG：对知识库 Markdown 文档分块并建立 BM25 倒排索引，检索相关资料。
+"""轻量 RAG：对 Markdown 做章节感知分块，并用字段加权 BM25 检索。
 
 设计取舍：DeepSeek 等常用服务不提供 Embedding 接口，因此本项目采用
-「中文二元组 + 英文单词」的词汇级 BM25 检索。对 FAQ / 产品文档类知识库
-足够有效，且零外部依赖、可离线运行、适合 k3s 部署。
+「中文二元组 + 英文单词」的词汇级 BM25 检索，并对文档标题、章节标题、
+正文设置不同权重。索引在文档加载时一次构建，查询只遍历命中词的倒排列表，
+适合资源受限的 k3s 部署。
 
 若日后接入 Embedding 服务，可在此模块基础上增加向量检索实现。
 """
@@ -16,12 +17,34 @@ from pathlib import Path
 
 from core.logging import get_logger
 
-MAX_CHUNK_CHARS = 420
+MAX_CHUNK_CHARS = 700
 _MIN_CHUNK_TOKENS = 8
 _K1 = 1.5
 _B = 0.75
+_DOCUMENT_WEIGHT = 1.5
+_HEADING_WEIGHT = 2.5
+_EXPANSION_WEIGHT = 0.65
+_MIN_ORIGINAL_QUERY_COVERAGE = 0.25
+_MIN_EXPANSION_MATCHES = 2
 # 只允许安全的 Markdown 文件名：字母/数字/中文/下划线/连字符 + .md，禁止路径穿越。
 _SAFE_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff][\w\u4e00-\u9fff\-]*\.md$")
+
+# 产品领域的高频口语归一化。扩展词只用于召回且权重低于原查询，避免覆盖用户原意。
+_QUERY_EXPANSIONS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("多少钱", "收费", "费用", "贵不贵"), "价格 计费 报价 套餐"),
+    (
+        ("自己服务器", "自己的集群", "本地部署", "自建", "本地化"),
+        "私有化部署 Kubernetes Docker",
+    ),
+    (("单点登录", "统一认证"), "SSO SAML OIDC 身份认证"),
+    (
+        ("数据泄露", "会不会泄露", "数据安全吗", "隐私安全"),
+        "数据安全 加密 权限 审计 脱敏",
+    ),
+    (("找回密码", "忘了密码", "不能登录", "登录不上"), "忘记密码 重置密码 账号锁定"),
+    (("对接", "接入现有系统", "系统集成"), "API Webhook 集成"),
+    (("容灾", "灾难恢复"), "备份恢复 RPO RTO"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,7 +54,6 @@ class KnowledgeChunk:
     source: str
     heading: str
     content: str
-    tokens: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,38 +81,52 @@ def tokenize(text: str) -> list[str]:
 
     tokens: list[str] = []
     for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9_\.\-]*", text):
-        tokens.append(word.lower())
+        normalized = word.lower()
+        tokens.append(normalized)
+        # 精确编号保留完整 token，同时拆出组成部分，兼容用户省略校验后缀。
+        for part in re.split(r"[_\.\-]+", normalized):
+            if len(part) > 1 and part != normalized:
+                tokens.append(part)
     for run in re.findall(r"[\u4e00-\u9fff]+", text):
         if len(run) == 1:
             tokens.append(run)
             continue
         for i in range(len(run) - 1):
             tokens.append(run[i : i + 2])
-        tokens.append(run[-1])
     return tokens
 
 
 def _split_sections(text: str) -> list[tuple[str, str]]:
-    """按 Markdown 标题（# / ## / ###）把文档切成 (heading, body)。"""
+    """按 Markdown 标题分段，并保留完整的 # > ## > ### 章节路径。"""
 
     lines = text.splitlines()
     sections: list[tuple[str, str]] = []
-    heading = "未分类"
+    headings: dict[int, str] = {}
     body: list[str] = []
+
+    def current_heading() -> str:
+        path = [headings[level] for level in sorted(headings)]
+        return " > ".join(path) if path else "未分类"
+
+    def flush() -> None:
+        content = "\n".join(body).strip()
+        if content:
+            sections.append((current_heading(), content))
+        body.clear()
 
     for line in lines:
         match = re.match(r"^(#{1,3})\s+(.+)$", line.strip())
-        if match and body:
-            sections.append((heading, "\n".join(body).strip()))
-            body = []
-            heading = match.group(2).strip()
-        elif match:
-            heading = match.group(2).strip()
-        else:
+        if not match:
             body.append(line)
+            continue
+        flush()
+        level = len(match.group(1))
+        headings[level] = match.group(2).strip()
+        for child_level in tuple(headings):
+            if child_level > level:
+                del headings[child_level]
 
-    if body and "".join(body).strip():
-        sections.append((heading, "\n".join(body).strip()))
+    flush()
     return sections
 
 
@@ -123,8 +159,9 @@ class KnowledgeBase:
         self.top_k = top_k
         self.min_score = min_score
         self.chunks: list[KnowledgeChunk] = []
-        self._index: dict[str, list[tuple[int, int]]] = {}
-        self._doc_len: list[int] = []
+        self._index: dict[str, list[tuple[int, float]]] = {}
+        self._doc_len: list[float] = []
+        self._source_indices: dict[str, set[int]] = {}
         self._avgdl = 0.0
         self._logger = get_logger()
 
@@ -140,6 +177,10 @@ class KnowledgeBase:
         """加载目录下所有 *.md 文档并建立索引；返回分块数。"""
 
         self.chunks = []
+        self._index = defaultdict(list)
+        self._doc_len = []
+        self._source_indices = defaultdict(set)
+        self._avgdl = 0.0
         if not self.docs_dir.is_dir():
             self._logger.warning("rag_no_dir", extra={"dir": str(self.docs_dir)})
             return 0
@@ -148,30 +189,45 @@ class KnowledgeBase:
             text = path.read_text(encoding="utf-8")
             for heading, body in _split_sections(text):
                 for sub_heading, sub_body in _chunk_section(heading, body):
-                    tokens = tokenize(sub_body)
-                    if len(tokens) < _MIN_CHUNK_TOKENS:
+                    body_tokens = tokenize(sub_body)
+                    if len(body_tokens) < _MIN_CHUNK_TOKENS:
                         continue
-                    self.chunks.append(
-                        KnowledgeChunk(path.stem, sub_heading, sub_body, tuple(tokens))
-                    )
+                    chunk = KnowledgeChunk(path.stem, sub_heading, sub_body)
+                    chunk_index = len(self.chunks)
+                    self.chunks.append(chunk)
+                    self._source_indices[path.stem].add(chunk_index)
 
-        self._build_index()
+                    weighted_tf: Counter[str] = Counter(body_tokens)
+                    for term, count in Counter(tokenize(path.stem)).items():
+                        weighted_tf[term] += count * _DOCUMENT_WEIGHT
+                    for term, count in Counter(tokenize(sub_heading)).items():
+                        weighted_tf[term] += count * _HEADING_WEIGHT
+                    document_length = sum(weighted_tf.values())
+                    self._doc_len.append(document_length)
+                    for term, count in weighted_tf.items():
+                        self._index[term].append((chunk_index, float(count)))
+
+        self._avgdl = sum(self._doc_len) / len(self._doc_len) if self._doc_len else 0.0
         self._logger.info(
             "rag_loaded",
             extra={"docs": self.document_count, "chunks": len(self.chunks)},
         )
         return len(self.chunks)
 
-    def _build_index(self) -> None:
-        self._index = defaultdict(list)
-        self._doc_len = []
-        for idx, chunk in enumerate(self.chunks):
-            tf = Counter(chunk.tokens)
-            self._doc_len.append(sum(tf.values()))
-            for term, count in tf.items():
-                self._index[term].append((idx, count))
-        n = len(self.chunks)
-        self._avgdl = sum(self._doc_len) / n if n else 0.0
+    @staticmethod
+    def _query_terms(query: str) -> dict[str, float]:
+        """生成原查询与低权重领域同义词，保留原查询的主导地位。"""
+
+        weighted: dict[str, float] = defaultdict(float)
+        for term, count in Counter(tokenize(query)).items():
+            weighted[term] += float(count)
+
+        normalized_query = re.sub(r"\s+", "", query).lower()
+        for triggers, expansion in _QUERY_EXPANSIONS:
+            if any(trigger.lower() in normalized_query for trigger in triggers):
+                for term in set(tokenize(expansion)):
+                    weighted[term] += _EXPANSION_WEIGHT
+        return weighted
 
     def retrieve(
         self,
@@ -184,54 +240,76 @@ class KnowledgeBase:
         if not self.chunks:
             return []
         limit = k or self.top_k
-        query_terms = set(tokenize(query))
+        query_terms = self._query_terms(query)
         if not query_terms:
             return []
 
         # 按文档过滤：source 是去扩展名的 stem，兼容调用方传带/不带 .md 的名字。
         if doc:
             doc_stem = doc.removesuffix(".md")
-            candidates = [c for c in self.chunks if c.source == doc_stem]
+            allowed_indices = self._source_indices.get(doc_stem, set())
         else:
-            candidates = list(self.chunks)
-        if not candidates:
+            allowed_indices = None
+        if doc and not allowed_indices:
             return []
 
-        # 对候选分块建立局部倒排索引（可按单篇文档检索）。
-        local_index: dict[str, list[tuple[int, int]]] = defaultdict(list)
-        doc_len: list[int] = []
-        for idx, chunk in enumerate(candidates):
-            tf = Counter(chunk.tokens)
-            doc_len.append(sum(tf.values()))
-            for term, count in tf.items():
-                local_index[term].append((idx, count))
-        n = len(candidates)
-        avgdl = sum(doc_len) / n if n else 0.0
-
-        scores = [0.0] * n
-        for term in query_terms:
-            postings = local_index.get(term)
+        # 直接复用加载阶段构建的全局倒排索引；查询复杂度取决于命中 posting，
+        # 不再随知识库总分块数线性重建索引。
+        n = len(self.chunks)
+        scores: dict[int, float] = defaultdict(float)
+        matched_query_terms: dict[int, set[str]] = defaultdict(set)
+        original_terms = set(tokenize(query))
+        for term, query_weight in query_terms.items():
+            postings = self._index.get(term)
             if not postings:
                 continue
             df = len(postings)
             idf = math.log(1.0 + (n - df + 0.5) / (df + 0.5))
             for doc_idx, tf in postings:
-                dl = doc_len[doc_idx]
-                denom = tf + _K1 * (1.0 - _B + _B * dl / avgdl) if avgdl else tf + _K1
-                scores[doc_idx] += idf * (tf * (_K1 + 1.0)) / denom
+                if allowed_indices is not None and doc_idx not in allowed_indices:
+                    continue
+                dl = self._doc_len[doc_idx]
+                denom = (
+                    tf + _K1 * (1.0 - _B + _B * dl / self._avgdl)
+                    if self._avgdl
+                    else tf + _K1
+                )
+                scores[doc_idx] += query_weight * idf * (tf * (_K1 + 1.0)) / denom
+                matched_query_terms[doc_idx].add(term)
 
-        ranked = sorted(range(n), key=lambda i: scores[i], reverse=True)
+        if not scores:
+            return []
+
+        # 查询词覆盖率作为温和校准项：避免只碰巧命中一个高频词的长段落排到前面。
+        original_term_count = max(len(original_terms), 1)
+        for doc_idx in scores:
+            matched_original = matched_query_terms[doc_idx] & original_terms
+            coverage = len(matched_original) / original_term_count
+            scores[doc_idx] *= 0.75 + 0.25 * coverage
+
+        ranked = sorted(scores, key=scores.__getitem__, reverse=True)
         results: list[RetrievedChunk] = []
-        for idx in ranked[:limit]:
+        for idx in ranked:
             # 全局检索时，低于最低相关度阈值视为噪音直接截断（分数降序）。
-            # 显式按单篇文档过滤时视为用户明确意图，不套全局阈值，
-            # 因为局部索引（n 很小）会让 idf 偏低，同一查询分数会下降。
+            # 显式按单篇文档过滤时视为用户明确意图，不套全局阈值；但由于候选分块
+            # 来自命中词的 posting，仍不会返回完全不相关的内容。
             if doc is None and scores[idx] <= self.min_score:
                 break
-            chunk = candidates[idx]
+            if doc is None:
+                matched_original = matched_query_terms[idx] & original_terms
+                original_coverage = len(matched_original) / original_term_count
+                expansion_matches = len(matched_query_terms[idx] - original_terms)
+                if (
+                    original_coverage < _MIN_ORIGINAL_QUERY_COVERAGE
+                    and expansion_matches < _MIN_EXPANSION_MATCHES
+                ):
+                    continue
+            chunk = self.chunks[idx]
             results.append(
                 RetrievedChunk(chunk.source, chunk.heading, chunk.content, scores[idx])
             )
+            if len(results) >= limit:
+                break
         return results
 
     # ============ 文档管理（查看 / 导入 / 删除） ============

@@ -443,6 +443,7 @@ async def chat_stream(
             for _round in range(MAX_TOOL_ROUNDS):
                 round_text: list[str] = []
                 tool_calls: list[LLMToolCall] = []
+                round_buffer_start = len(buffer)
                 async for event in llm.stream_round(
                     messages=turns,
                     request_id=request_id,
@@ -450,18 +451,22 @@ async def chat_stream(
                     rag_chunks=rag_chunks,
                 ):
                     if event.kind == "delta":
-                        # 先暂存本轮文本：确认本轮没有工具调用后才推给前端，
-                        # 避免工具调用轮把内部 DSML 泄漏到回答。
+                        # LLM 客户端已增量过滤内部工具协议，普通文本可以立即推给前端。
                         round_text.append(event.text)
+                        buffer.append(event.text)
+                        yield _sse({"type": "delta", "text": event.text})
                     elif event.kind == "tool_call" and event.tool_call is not None:
                         tool_calls.append(event.tool_call)
 
                 if not tool_calls:
-                    # 自然语言轮：本轮的文本才是最终回答，此时才流式推送。
-                    for chunk in round_text:
-                        buffer.append(chunk)
-                        yield _sse({"type": "delta", "text": chunk})
+                    # 自然语言轮已经随上游增量发送，直接结束工具循环。
                     break
+
+                # 工具调用轮可能带有“让我查一下”等可见前缀。清除本轮临时文本，
+                # 避免它混入最终答案；前端保留同一个消息气泡等待下一轮增量。
+                if len(buffer) > round_buffer_start:
+                    del buffer[round_buffer_start:]
+                    yield _sse({"type": "reset"})
 
                 # 推理型模型的思考内容必须随工具调用回传，否则上游返回 400。
                 reasoning_content = tool_calls[0].reasoning_content
@@ -546,10 +551,10 @@ async def chat_stream(
                     )
 
                 if not assistant_tool_calls:
-                    # 只出现未知工具：把本轮回退为自然语言轮。
-                    for chunk in round_text:
-                        buffer.append(chunk)
-                        yield _sse({"type": "delta", "text": chunk})
+                    # 只出现未知工具：恢复已经展示的自然语言，作为本轮回答。
+                    buffer.extend(round_text)
+                    if round_text:
+                        yield _sse({"type": "delta", "text": "".join(round_text)})
                     break
 
                 # 追加助手工具调用（含思考内容）与全部工具结果，继续下一轮。

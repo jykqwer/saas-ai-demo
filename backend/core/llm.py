@@ -119,6 +119,123 @@ _TEXT_TOOL_WRAPPER_RE = re.compile(
 )
 _KNOWN_TOOL_NAMES = {"web_search", "retrieve_knowledge_base"}
 
+# 文本化工具标记可能被上游拆成任意 SSE 分片。普通内容需要立刻下发，同时又不能
+# 把这些内部协议短暂展示给用户，因此只暂挂“可能是工具标签”的 `<...` 片段。
+_TEXT_TOOL_OPEN_MARKERS = (
+    "<invoke",
+    "<antml:invoke",
+    "<||dsml||invoke",
+    "<｜｜dsml｜｜invoke",
+)
+_TEXT_TOOL_WRAPPER_MARKERS = (
+    "<tool_calls",
+    "</tool_calls",
+    "<antml:tool_calls",
+    "</antml:tool_calls",
+    "<||dsml||tool_calls",
+    "</||dsml||tool_calls",
+    "<｜｜dsml｜｜tool_calls",
+    "</｜｜dsml｜｜tool_calls",
+)
+_TEXT_TOOL_MARKERS = _TEXT_TOOL_OPEN_MARKERS + _TEXT_TOOL_WRAPPER_MARKERS
+_TEXT_INVOKE_CLOSE_RE = re.compile(
+    r"</(?:(?:antml:)|(?:(?:\|\||｜｜)dsml(?:\|\||｜｜)))?invoke\s*>",
+    re.IGNORECASE,
+)
+
+
+class _VisibleContentFilter:
+    """增量隐藏文本化工具协议，只返回可以立即展示的普通文本。"""
+
+    def __init__(self) -> None:
+        self._pending = ""
+        self._inside_invoke = False
+
+    def feed(self, text: str) -> list[str]:
+        self._pending += text
+        visible: list[str] = []
+
+        while self._pending:
+            if self._inside_invoke:
+                close = _TEXT_INVOKE_CLOSE_RE.search(self._pending)
+                if close is None:
+                    # 整段工具参数保持在服务端，等待跨分片的闭合标签。
+                    return visible
+                self._pending = self._pending[close.end() :]
+                self._inside_invoke = False
+                continue
+
+            marker_start = self._pending.find("<")
+            if marker_start < 0:
+                visible.append(self._pending)
+                self._pending = ""
+                break
+            if marker_start > 0:
+                prefix = self._pending[:marker_start]
+                possible_wrapper = self._pending[marker_start:].lower()
+                # DSML wrapper常用换行包住 invoke；这些排版空白也属于内部协议。
+                if not (
+                    prefix.isspace()
+                    and any(
+                        marker.startswith(possible_wrapper)
+                        or possible_wrapper.startswith(marker)
+                        for marker in _TEXT_TOOL_MARKERS
+                    )
+                ):
+                    visible.append(prefix)
+                self._pending = self._pending[marker_start:]
+                continue
+
+            lowered = self._pending.lower()
+            if any(marker.startswith(lowered) for marker in _TEXT_TOOL_MARKERS):
+                # 当前分片只是某个工具标签的前缀，等待下一分片再判断。
+                break
+
+            open_marker = next(
+                (
+                    marker
+                    for marker in _TEXT_TOOL_OPEN_MARKERS
+                    if lowered.startswith(marker)
+                ),
+                None,
+            )
+            wrapper_marker = next(
+                (
+                    marker
+                    for marker in _TEXT_TOOL_WRAPPER_MARKERS
+                    if lowered.startswith(marker)
+                ),
+                None,
+            )
+            if open_marker or wrapper_marker:
+                tag_end = self._pending.find(">")
+                if tag_end < 0:
+                    break
+                self._pending = self._pending[tag_end + 1 :]
+                if open_marker:
+                    self._inside_invoke = True
+                continue
+
+            # 普通 HTML/比较符号等不是内部协议，仅延迟一个字符后正常展示。
+            visible.append("<")
+            self._pending = self._pending[1:]
+
+        return visible
+
+    def finish(self) -> list[str]:
+        """流结束时刷新普通尾部；不完整的工具协议按内部内容丢弃。"""
+
+        if self._inside_invoke:
+            self._pending = ""
+            return []
+        pending = self._pending
+        self._pending = ""
+        if len(pending) > 1 and any(
+            marker.startswith(pending.lower()) for marker in _TEXT_TOOL_MARKERS
+        ):
+            return []
+        return [pending] if pending else []
+
 
 def strip_text_tool_calls(text: str) -> str:
     """从最终文本里剔除残留的工具调用标记（兜底清理）。"""
@@ -339,8 +456,9 @@ class LLMClient:
 
         tool_calls: dict[int, dict[str, str]] = {}
         reasoning_parts: list[str] = []
-        # 先保留本轮文本，流结束后统一识别可能跨多个 SSE 分片的文本化工具调用。
+        # 保留原文用于流结束后识别文本化工具调用；可见普通文本经增量过滤后立即下发。
         content_parts: list[str] = []
+        visible_filter = _VisibleContentFilter()
         try:
             async with self._http.stream(
                 "POST",
@@ -377,6 +495,9 @@ class LLMClient:
                     content = delta.get("content")
                     if content:
                         content_parts.append(content)
+                        for visible_text in visible_filter.feed(content):
+                            if visible_text:
+                                yield StreamEvent(kind="delta", text=visible_text)
                     # 推理型模型的思考内容：需要随工具调用一并回传。
                     reasoning = delta.get("reasoning_content")
                     if reasoning:
@@ -393,6 +514,9 @@ class LLMClient:
                             entry["name"] += function["name"]
                         if function.get("arguments"):
                             entry["arguments"] += function["arguments"]
+                for visible_text in visible_filter.finish():
+                    if visible_text:
+                        yield StreamEvent(kind="delta", text=visible_text)
         except httpx.TimeoutException as exc:
             get_logger().warning(
                 "llm_stream_timeout",
@@ -424,15 +548,6 @@ class LLMClient:
         reasoning = "".join(reasoning_parts)
         full_content = "".join(content_parts)
         text_calls = _parse_text_tool_calls(full_content, reasoning)
-        cleaned_content = strip_text_tool_calls(full_content)
-
-        # 普通回答保持上游分片；存在文本化工具标记时只下发清理后的可见文本。
-        if cleaned_content:
-            if cleaned_content == full_content:
-                for part in content_parts:
-                    yield StreamEvent(kind="delta", text=part)
-            else:
-                yield StreamEvent(kind="delta", text=cleaned_content)
 
         # 同一响应可能包含多个工具调用。文本化与结构化结果按名称+参数去重，
         # 避免某些兼容接口同时返回两种表示时重复执行工具。

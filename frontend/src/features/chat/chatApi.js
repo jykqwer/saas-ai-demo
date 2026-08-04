@@ -76,6 +76,7 @@ export async function sendChatMessage({ content, sessionId }) {
  * SSE 流式聊天。解析后端推送的 data 帧，按类型回调：
  * - meta:  { type, session_id, model, provider, mock }
  * - delta: { type, text }
+ * - reset: 清除工具调用轮产生的临时可见文本
  * - done:  { type, session_id, ... }
  * - error: { type, code, message }
  * 返回 { ok, error }。
@@ -114,6 +115,7 @@ export async function streamChat({ content, sessionId, mode }, handlers) {
     else if (payload?.type === 'delta') handlers.onDelta?.(payload.text ?? '')
     else if (payload?.type === 'search') handlers.onSearch?.(payload)
     else if (payload?.type === 'rag_used') handlers.onRagUsed?.(payload)
+    else if (payload?.type === 'reset') handlers.onReset?.()
     else if (payload?.type === 'done') handlers.onDone?.(payload)
     else if (payload?.type === 'error') handlers.onError?.(payload)
   }

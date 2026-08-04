@@ -198,6 +198,16 @@ export default function ChatPage({
               return next
             })
           },
+          onReset: () => {
+            setMessages((prev) => {
+              const next = [...prev]
+              const last = next[next.length - 1]
+              if (last?.role === 'assistant' && last.streaming) {
+                next[next.length - 1] = { ...last, content: '' }
+              }
+              return next
+            })
+          },
           onDone: (done) => {
             if (done.quota) onQuotaChange?.(done.quota)
             setMessages((prev) => {

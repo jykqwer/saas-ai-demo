@@ -11,9 +11,15 @@ from core.config import Settings, get_settings
 from core.errors import register_error_handlers
 from core.llm import LLMClient
 from core.logging import APP_LOGGER_NAME, configure_logging, get_logger
+from core.model_gateway import ModelGateway
 from core.request_id import RequestIdMiddleware
 from core.request_logging import RequestLoggingMiddleware
+from core.tools import build_tool_registry
 from domain.chat import build_assistant_profile, build_mock_reply
+from infrastructure.agent_repository import (
+    EphemeralAgentRepository,
+    SqlAlchemyAgentRepository,
+)
 from infrastructure.auth_repository import (
     EphemeralAuthRepository,
     SqlAlchemyAuthRepository,
@@ -77,7 +83,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         product_name=resolved_settings.saas_product_name,
         company_name=resolved_settings.saas_company_name,
     )
-    app.state.llm_client = LLMClient(
+    primary_llm = LLMClient(
         api_key=resolved_settings.llm_api_key,
         base_url=resolved_settings.llm_base_url,
         model=resolved_settings.llm_model,
@@ -92,6 +98,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             timezone_name=resolved_settings.quota_timezone,
         ),
     )
+    vision_llm = None
+    if resolved_settings.qwen_api_key:
+        vision_llm = LLMClient(
+            api_key=resolved_settings.qwen_api_key,
+            base_url=resolved_settings.qwen_base_url,
+            model=resolved_settings.qwen_vision_model,
+            timeout_seconds=resolved_settings.llm_timeout_seconds,
+            max_context_turns=resolved_settings.llm_max_context_turns,
+            max_retries=resolved_settings.llm_max_retries,
+            retry_base_delay_seconds=resolved_settings.llm_retry_base_delay_seconds,
+            mock_reply=lambda question, rag_chunks: build_mock_reply(
+                question,
+                assistant_profile,
+                rag_chunks,
+                timezone_name=resolved_settings.quota_timezone,
+            ),
+        )
+    app.state.llm_client = ModelGateway(primary=primary_llm, vision=vision_llm)
 
     # RAG 知识库：启用时加载文档并建立检索索引；失败或禁用时置为 None。
     if resolved_settings.rag_enabled:
@@ -99,6 +123,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             resolved_settings.rag_knowledge_base_dir,
             top_k=resolved_settings.rag_top_k,
             min_score=resolved_settings.rag_min_score,
+            candidate_k=resolved_settings.rag_candidate_k,
+            vector_weight=resolved_settings.rag_vector_weight,
         )
         rag.load()
         app.state.rag = rag if rag.chunk_count > 0 else None
@@ -124,6 +150,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 extra={"provider": resolved_settings.web_search_provider},
             )
 
+    app.state.tool_registry = build_tool_registry(
+        rag=app.state.rag,
+        web_search=app.state.web_search,
+    )
+
     # 会话仓库：配置 DATABASE_URL 时使用 PostgreSQL 持久化，否则用内存实现。
     if resolved_settings.database_url is not None:
         database = SqlAlchemyDatabase(resolved_settings.database_url)
@@ -134,10 +165,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.auth_repository = SqlAlchemyAuthRepository(
             database.session_factory_any
         )
+        app.state.agent_repository = SqlAlchemyAgentRepository(
+            database.session_factory_any
+        )
     else:
         app.state.database = None
         app.state.chat_repository = EphemeralChatRepository()
         app.state.auth_repository = EphemeralAuthRepository()
+        app.state.agent_repository = EphemeralAgentRepository()
 
     if resolved_settings.cors_origins:
         app.add_middleware(

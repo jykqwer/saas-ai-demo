@@ -27,6 +27,7 @@ export default function ChatPage({
   const [activeSessionId, setActiveSessionId] = useState(null)
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
+  const [images, setImages] = useState([])
   const [streaming, setStreaming] = useState(false)
   const [error, setError] = useState('')
   const [mode, setMode] = useState('auto')
@@ -157,20 +158,22 @@ export default function ChatPage({
       }
 
       const sessionId = activeSessionRef.current
+      const imagePayload = images.map((image) => image.url)
       setInput('')
+      setImages([])
       setError('')
       setHandoffDone('')
       // 用户消息 + 单个助手占位气泡：打字动画/流式内容都在同一个气泡内，
       // 避免出现“两个回答框”，也避免结束后整表重拉导致的闪烁。
       setMessages((prev) => [
         ...prev,
-        { role: 'user', content: text },
+        { role: 'user', content: text, images: imagePayload },
         { role: 'assistant', content: '', streaming: true },
       ])
       setStreaming(true)
 
       const result = await streamChat(
-        { content: text, sessionId, mode },
+        { content: text, sessionId, mode, images: imagePayload },
         {
           onMeta: (meta) => {
             if (!activeSessionRef.current) setSession(meta.session_id)
@@ -286,6 +289,7 @@ export default function ChatPage({
     },
     [
       input,
+      images,
       mode,
       onQuotaChange,
       onSessionExpired,
@@ -301,6 +305,7 @@ export default function ChatPage({
     setSession(null)
     setMessages([])
     setInput('')
+    setImages([])
     setError('')
     setHandoffDone('')
     inputRef.current?.focus()
@@ -344,6 +349,31 @@ export default function ChatPage({
       e.preventDefault()
       send()
     }
+  }
+
+  const selectImages = (event) => {
+    const files = Array.from(event.target.files ?? [])
+    event.target.value = ''
+    if (!config?.vision_configured) {
+      setError('图片理解未配置，请设置 QWEN_API_KEY。')
+      return
+    }
+    const accepted = files.filter(
+      (file) => ['image/png', 'image/jpeg', 'image/webp'].includes(file.type) && file.size <= 5 * 1024 * 1024,
+    )
+    if (accepted.length !== files.length) {
+      setError('仅支持 5MB 以内的 PNG、JPEG 或 WebP 图片。')
+    }
+    accepted.slice(0, Math.max(0, 4 - images.length)).forEach((file) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        setImages((current) => [
+          ...current,
+          { name: file.name, url: String(reader.result) },
+        ].slice(0, 4))
+      }
+      reader.readAsDataURL(file)
+    })
   }
 
   const configured = config?.configured ?? false
@@ -551,7 +581,27 @@ export default function ChatPage({
         {handoffDone && <div className="success-banner">✅ {handoffDone}</div>}
 
         <div className="chat-input-bar">
+          {images.length > 0 && (
+            <div className="image-preview-list">
+              {images.map((image, index) => (
+                <div className="image-preview" key={`${image.name}-${index}`}>
+                  <img src={image.url} alt={image.name} />
+                  <button type="button" onClick={() => setImages((current) => current.filter((_, i) => i !== index))}>×</button>
+                </div>
+              ))}
+            </div>
+          )}
           <div className="chat-input-wrap">
+            <label className={`image-upload-btn ${config?.vision_configured ? '' : 'disabled'}`} title="添加图片">
+              🖼
+              <input
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                multiple
+                disabled={streaming || !canAsk || !config?.vision_configured}
+                onChange={selectImages}
+              />
+            </label>
             <textarea
               ref={inputRef}
               rows={1}

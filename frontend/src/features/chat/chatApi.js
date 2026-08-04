@@ -81,14 +81,19 @@ export async function sendChatMessage({ content, sessionId }) {
  * - error: { type, code, message }
  * 返回 { ok, error }。
  */
-export async function streamChat({ content, sessionId, mode }, handlers) {
+export async function streamChat({ content, sessionId, mode, images = [] }, handlers) {
   const response = await fetch('/api/v1/chat/stream', {
     method: 'POST',
     headers: authorizedHeaders({
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
     }),
-    body: JSON.stringify({ content, session_id: sessionId ?? null, mode: mode ?? 'auto' }),
+    body: JSON.stringify({
+      content,
+      session_id: sessionId ?? null,
+      mode: mode ?? 'auto',
+      images,
+    }),
   })
 
   if (!response.ok) {

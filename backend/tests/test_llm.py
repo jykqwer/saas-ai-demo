@@ -10,7 +10,7 @@ from core.llm import ChatProviderError, LLMClient, strip_text_tool_calls
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def _make_client(handler, *, max_retries: int = 2) -> LLMClient:

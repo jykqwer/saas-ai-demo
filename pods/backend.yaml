@@ -38,6 +38,10 @@ spec:
               value: "true"
             - name: RAG_TOP_K
               value: "3"
+            - name: RAG_CANDIDATE_K
+              value: "24"
+            - name: RAG_VECTOR_WEIGHT
+              value: "0.4"
             # 网络搜索
             - name: WEB_SEARCH_ENABLED
               value: "true"
@@ -79,6 +83,24 @@ spec:
                 secretKeyRef:
                   name: llm-credentials
                   key: LLM_MODEL
+            - name: QWEN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-credentials
+                  key: QWEN_API_KEY
+                  optional: true
+            - name: QWEN_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: llm-credentials
+                  key: QWEN_BASE_URL
+                  optional: true
+            - name: QWEN_VISION_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: llm-credentials
+                  key: QWEN_VISION_MODEL
+                  optional: true
             - name: LLM_MAX_RETRIES
               value: "2"
             - name: LLM_RETRY_BASE_DELAY_SECONDS

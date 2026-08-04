@@ -1,5 +1,7 @@
 """AI 客服/售前助手的聊天接口、流式输出与人工转接接口。"""
 
+import base64
+import binascii
 import json
 from datetime import datetime
 from typing import Literal
@@ -10,20 +12,17 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from core.agent import AgentExecutionError, AgentOrchestrator
 from core.auth import AuthenticatedUser, consume_question_quota
 from core.errors import ApiError
-from core.llm import ChatProviderError, LLMToolCall, strip_text_tool_calls
+from core.llm import ChatProviderError
 from domain.chat import (
     MAX_MESSAGE_CHARS,
-    RETRIEVE_KB_TOOL,
-    WEB_SEARCH_TOOL,
     AssistantProfile,
     build_assistant_profile,
     build_system_prompt,
     format_rag_context,
-    format_rag_tool_results,
     format_web_context,
-    format_web_results,
 )
 from domain.session import (
     MAX_CONTACT_VALUE_CHARS,
@@ -32,6 +31,7 @@ from domain.session import (
 )
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
 
 def _sse(payload: dict) -> str:
@@ -68,6 +68,7 @@ class ChatRequest(BaseModel):
 
     content: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     session_id: UUID | None = None
+    images: list[str] = Field(default_factory=list, max_length=4)
     # auto=智能（模型按需联网）；web=始终联网；knowledge=仅知识库
     mode: Literal["auto", "web", "knowledge"] = "auto"
 
@@ -78,6 +79,31 @@ class ChatRequest(BaseModel):
         if not normalized:
             raise ValueError("content must contain non-whitespace characters")
         return normalized
+
+    @field_validator("images")
+    @classmethod
+    def validate_images(cls, images: list[str]) -> list[str]:
+        validated: list[str] = []
+        for image in images:
+            if len(image) > 7_000_000:
+                raise ValueError("each image must be smaller than 5 MB")
+            if not image.startswith(
+                (
+                    "data:image/png;base64,",
+                    "data:image/jpeg;base64,",
+                    "data:image/webp;base64,",
+                )
+            ):
+                raise ValueError("images must be PNG, JPEG, or WebP data URLs")
+            try:
+                encoded = image.split(",", 1)[1]
+                decoded = base64.b64decode(encoded, validate=True)
+            except (IndexError, binascii.Error, ValueError) as exc:
+                raise ValueError("images must contain valid base64 data") from exc
+            if len(decoded) > MAX_IMAGE_BYTES:
+                raise ValueError("each image must be smaller than 5 MB")
+            validated.append(image)
+        return validated
 
 
 class ChatResponse(BaseModel):
@@ -134,6 +160,8 @@ class ChatConfigResponse(BaseModel):
     configured: bool
     provider: str
     model: str
+    vision_configured: bool = False
+    vision_model: str | None = None
     rag_docs: int = 0
     rag_chunks: int = 0
     quick_questions: list[dict[str, str]]
@@ -194,6 +222,7 @@ async def _build_turns(
     content: str,
     *,
     pre_inject_rag: bool = True,
+    images: list[str] | None = None,
 ) -> tuple[list[dict], list]:
     """加载最近上下文并追加当前用户消息，构造带系统提示词与 RAG 上下文的输入。
 
@@ -214,7 +243,15 @@ async def _build_turns(
     # 保留最近 N 轮（2N 条消息），避免请求体无界增长。
     for message in history[-settings.llm_max_context_turns * 2 :]:
         turns.append({"role": message.role, "content": message.content})
-    turns.append({"role": "user", "content": content})
+    user_content: str | list[dict]
+    if images:
+        user_content = [
+            *[{"type": "image_url", "image_url": {"url": image}} for image in images],
+            {"type": "text", "text": content},
+        ]
+    else:
+        user_content = content
+    turns.append({"role": "user", "content": user_content})
     return turns, rag_chunks
 
 
@@ -259,9 +296,10 @@ async def chat(
     request_id = getattr(request.state, "request_id", "unknown")
     await consume_question_quota(request, user)
     session = await _resolve_session(request, body.session_id, body.content, user.id)
+    turns, rag_chunks = await _build_turns(
+        request, session.id, body.content, images=body.images
+    )
     await _persist(request, session_id=session.id, role="user", content=body.content)
-
-    turns, rag_chunks = await _build_turns(request, session.id, body.content)
     try:
         result = await llm.chat(
             messages=turns, request_id=request_id, rag_chunks=rag_chunks
@@ -319,7 +357,7 @@ async def chat_stream(
 ) -> StreamingResponse:
     """SSE 流式对话：逐段推送助手回复增量，结束时落库。"""
 
-    llm = request.app.state.llm_client
+    gateway = request.app.state.llm_client
     request_id = getattr(request.state, "request_id", "unknown")
     quota = await consume_question_quota(request, user)
 
@@ -328,24 +366,24 @@ async def chat_stream(
             session = await _resolve_session(
                 request, body.session_id, body.content, user.id
             )
-            await _persist(
-                request, session_id=session.id, role="user", content=body.content
-            )
-
             mode = body.mode or "auto"
             web_search = getattr(request.app.state, "web_search", None)
-            rag = _rag_engine(request)
 
             # 预注入知识库的条件：演示模式（无工具循环）以及仅知识库模式。
             # 真实自动/始终联网模式不预注入：auto 由模型调用 retrieve_knowledge_base
             # 按需检索，web 为纯联网（只注入搜索结果）。
-            pre_inject_rag = (not llm.configured) or mode == "knowledge"
+            pre_inject_rag = (not gateway.configured) or mode == "knowledge"
             turns, rag_chunks = await _build_turns(
                 request,
                 session.id,
                 body.content,
                 pre_inject_rag=pre_inject_rag,
+                images=body.images,
             )
+            await _persist(
+                request, session_id=session.id, role="user", content=body.content
+            )
+            llm = gateway.select(turns)
 
             # 模式提示词：明确约束模型行为。
             mode_note = {
@@ -362,6 +400,23 @@ async def chat_stream(
             if mode_note:
                 turns[0] = {**turns[0], "content": turns[0]["content"] + mode_note}
 
+            agent_run = await request.app.state.agent_repository.create_run(
+                session_id=session.id,
+                owner_user_id=user.id,
+                mode=mode,
+                input_text=body.content,
+            )
+
+            initial_rag_meta = [
+                {
+                    "source": chunk.source,
+                    "heading": chunk.heading,
+                    "score": round(chunk.score, 3),
+                    "retrieval": getattr(chunk, "retrieval", None),
+                }
+                for chunk in rag_chunks
+            ]
+
             # 开头先推送元信息（会话 ID、模型、接入状态、RAG 来源）。
             yield _sse(
                 {
@@ -371,55 +426,21 @@ async def chat_stream(
                     "provider": llm.provider,
                     "mock": not llm.configured,
                     "mode": mode,
-                    "rag": [
-                        {
-                            "source": chunk.source,
-                            "heading": chunk.heading,
-                            "score": round(chunk.score, 3),
-                        }
-                        for chunk in rag_chunks
-                    ],
+                    "run_id": str(agent_run.id),
+                    "rag": initial_rag_meta,
                     "quota": quota.model_dump(mode="json"),
                 }
             )
 
-            tools = None
-            tool_used = False
-            web_count = 0
-            rag_count = len(rag_chunks)
-            # 本轮实际采用的来源（供落库持久化，刷新会话后仍可展示）。
-            used_rag_meta: list[dict] = [
-                {
-                    "source": chunk.source,
-                    "heading": chunk.heading,
-                    "score": round(chunk.score, 3),
-                }
-                for chunk in rag_chunks
-            ]
-            used_web_meta: list[dict] = []
-            web_query: str | None = None
-            buffer: list[str] = []
-
-            # 模式分支：
-            # - knowledge：不联网、不传工具（知识库已预注入）
-            # - web：不注入知识库，无条件联网检索并注入搜索结果，再作答（不传工具）
-            # - auto：分别按可用能力组装知识库检索 + 联网工具，模型按需决策。
-            #   关闭联网不应让模型失去 RAG 工具，反之亦然。
-            if mode == "auto":
-                tools = []
-                if rag is not None:
-                    tools.append(RETRIEVE_KB_TOOL)
-                if web_search is not None:
-                    tools.append(WEB_SEARCH_TOOL)
-                tools = tools or None
-            elif mode == "web" and web_search is not None:
+            initial_web_meta: list[dict] = []
+            initial_web_query: str | None = None
+            if mode == "web" and web_search is not None:
                 results = await web_search.search(body.content)
-                web_count = len(results)
-                used_web_meta = [
+                initial_web_meta = [
                     {"title": r.title, "url": r.url, "snippet": r.snippet}
                     for r in results
                 ]
-                web_query = body.content
+                initial_web_query = body.content
                 if results:
                     turns[0] = {
                         **turns[0],
@@ -429,194 +450,57 @@ async def chat_stream(
                     {
                         "type": "search",
                         "query": body.content,
-                        "results": [
-                            {"title": r.title, "url": r.url, "snippet": r.snippet}
-                            for r in results
-                        ],
+                        "results": initial_web_meta,
                     }
                 )
 
-            # 工具循环：auto 模式下模型可请求检索知识库或联网，执行后基于结果作答。
-            # DeepSeek 推理模型支持连续多轮工具调用：保留工具定义、循环多轮，
-            # 直到模型输出自然语言为止；用轮次上限兜底防死循环。
-            MAX_TOOL_ROUNDS = 4
-            for _round in range(MAX_TOOL_ROUNDS):
-                round_text: list[str] = []
-                tool_calls: list[LLMToolCall] = []
-                round_buffer_start = len(buffer)
-                async for event in llm.stream_round(
-                    messages=turns,
-                    request_id=request_id,
-                    tools=tools,
-                    rag_chunks=rag_chunks,
-                ):
-                    if event.kind == "delta":
-                        # LLM 客户端已增量过滤内部工具协议，普通文本可以立即推给前端。
-                        round_text.append(event.text)
-                        buffer.append(event.text)
-                        yield _sse({"type": "delta", "text": event.text})
-                    elif event.kind == "tool_call" and event.tool_call is not None:
-                        tool_calls.append(event.tool_call)
-
-                if not tool_calls:
-                    # 自然语言轮已经随上游增量发送，直接结束工具循环。
-                    break
-
-                # 工具调用轮可能带有“让我查一下”等可见前缀。清除本轮临时文本，
-                # 避免它混入最终答案；前端保留同一个消息气泡等待下一轮增量。
-                if len(buffer) > round_buffer_start:
-                    del buffer[round_buffer_start:]
-                    yield _sse({"type": "reset"})
-
-                # 推理型模型的思考内容必须随工具调用回传，否则上游返回 400。
-                reasoning_content = tool_calls[0].reasoning_content
-                assistant_tool_calls: list[dict] = []
-                tool_results: list[dict] = []
-
-                for tool_call in tool_calls:
-                    try:
-                        arguments = json.loads(tool_call.arguments or "{}")
-                    except json.JSONDecodeError:
-                        arguments = {}
-                    query = str(arguments.get("query", "")).strip()
-
-                    if tool_call.name == "web_search":
-                        tool_used = True
-                        results = (
-                            await web_search.search(query)
-                            if web_search is not None and query
-                            else []
-                        )
-                        current_web_meta = [
-                            {"title": r.title, "url": r.url, "snippet": r.snippet}
-                            for r in results
-                        ]
-                        used_web_meta = _merge_source_rows(
-                            used_web_meta,
-                            current_web_meta,
-                            keys=("url",),
-                        )
-                        web_count = len(used_web_meta)
-                        web_query = query
-                        yield _sse(
-                            {
-                                "type": "search",
-                                "query": query,
-                                # 推送累计来源，后一次空结果不会清掉前一次有效来源。
-                                "results": used_web_meta,
-                            }
-                        )
-                        tool_content = format_web_results(results)
-                    elif tool_call.name == "retrieve_knowledge_base":
-                        # 知识库按需检索：只有模型判定为产品问题时才执行并展示来源。
-                        chunks = (
-                            rag.retrieve(query) if rag is not None and query else []
-                        )
-                        current_rag_meta = [
-                            {
-                                "source": c.source,
-                                "heading": c.heading,
-                                "score": round(c.score, 3),
-                            }
-                            for c in chunks
-                        ]
-                        used_rag_meta = _merge_source_rows(
-                            used_rag_meta,
-                            current_rag_meta,
-                            keys=("source", "heading"),
-                        )
-                        rag_count = len(used_rag_meta)
-                        yield _sse({"type": "rag_used", "rag": used_rag_meta})
-                        tool_content = format_rag_tool_results(chunks)
-                    else:
-                        # 未知工具：不执行，也不回传。
-                        continue
-
-                    assistant_tool_calls.append(
-                        {
-                            "id": tool_call.id,
-                            "type": "function",
-                            "function": {
-                                "name": tool_call.name,
-                                "arguments": tool_call.arguments,
-                            },
-                        }
-                    )
-                    tool_results.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_content,
-                        }
-                    )
-
-                if not assistant_tool_calls:
-                    # 只出现未知工具：恢复已经展示的自然语言，作为本轮回答。
-                    buffer.extend(round_text)
-                    if round_text:
-                        yield _sse({"type": "delta", "text": "".join(round_text)})
-                    break
-
-                # 追加助手工具调用（含思考内容）与全部工具结果，继续下一轮。
-                # 工具调用轮的文本进入 assistant 消息上下文，不进入最终回答。
-                assistant_msg: dict = {
-                    "role": "assistant",
-                    "content": strip_text_tool_calls("".join(round_text)),
-                    "tool_calls": assistant_tool_calls,
-                }
-                if reasoning_content:
-                    assistant_msg["reasoning_content"] = reasoning_content
-                turns = [*turns, assistant_msg, *tool_results]
-                # 关键：不设 tools=None，保留工具定义让模型可连续多轮调用；
-                # 由 MAX_TOOL_ROUNDS 上限兜底，杜绝死循环。
-            else:
-                # 不再通过 tools=None 强迫模型收敛：这会让模型把内部 DSML 当文本
-                # 输出。达到上限后返回受控错误，保证内部协议不会展示或落库。
+            orchestrator = AgentOrchestrator(
+                repository=request.app.state.agent_repository,
+                tools=request.app.state.tool_registry,
+            )
+            async for event in orchestrator.run_stream(
+                run_id=agent_run.id,
+                llm=llm,
+                messages=turns,
+                request_id=request_id,
+                mode=mode,
+                rag_chunks=rag_chunks,
+                tools_enabled=mode == "auto",
+                initial_rag=initial_rag_meta,
+                initial_web=initial_web_meta,
+                initial_web_query=initial_web_query,
+            ):
+                if event["type"] != "agent_complete":
+                    yield _sse(event)
+                    continue
+                await _persist(
+                    request,
+                    session_id=session.id,
+                    role="assistant",
+                    content=event["reply"],
+                    provider=llm.provider,
+                    model=llm.model,
+                    mock=not llm.configured,
+                    sources=event["sources"],
+                )
                 yield _sse(
                     {
-                        "type": "error",
-                        "code": "TOOL_ROUND_LIMIT",
-                        "message": "检索次数过多，请缩小问题范围后重试。",
+                        "type": "done",
+                        "session_id": str(session.id),
+                        "run_id": str(agent_run.id),
+                        "model": llm.model,
+                        "provider": llm.provider,
+                        "mock": not llm.configured,
+                        "mode": mode,
+                        "web": event["web"] or mode == "web",
+                        "web_count": event["web_count"],
+                        "rag_count": event["rag_count"],
+                        "quota": quota.model_dump(mode="json"),
                     }
                 )
-                return
-
-            reply = strip_text_tool_calls("".join(buffer))
-            # 组装本轮实际采用的来源，随助手消息落库以便刷新后恢复展示。
-            sources: dict | None = None
-            if used_rag_meta or used_web_meta:
-                sources = {}
-                if used_rag_meta:
-                    sources["rag"] = used_rag_meta
-                if used_web_meta:
-                    sources["web"] = used_web_meta
-                    if web_query:
-                        sources["web_query"] = web_query
-            await _persist(
-                request,
-                session_id=session.id,
-                role="assistant",
-                content=reply,
-                provider=llm.provider,
-                model=llm.model,
-                mock=not llm.configured,
-                sources=sources,
-            )
-            yield _sse(
-                {
-                    "type": "done",
-                    "session_id": str(session.id),
-                    "model": llm.model,
-                    "provider": llm.provider,
-                    "mock": not llm.configured,
-                    "mode": mode,
-                    "web": tool_used or mode == "web",
-                    "web_count": web_count,
-                    "rag_count": rag_count,
-                    "quota": quota.model_dump(mode="json"),
-                }
-            )
         except ChatProviderError as exc:
+            yield _sse({"type": "error", "code": exc.code, "message": exc.message})
+        except AgentExecutionError as exc:
             yield _sse({"type": "error", "code": exc.code, "message": exc.message})
         except ApiError as exc:
             yield _sse(
@@ -715,6 +599,8 @@ async def chat_config(request: Request) -> ChatConfigResponse:
         configured=llm.configured,
         provider=llm.provider,
         model=settings.llm_model,
+        vision_configured=llm.vision_configured,
+        vision_model=llm.vision_model,
         rag_docs=rag.document_count if rag else 0,
         rag_chunks=rag.chunk_count if rag else 0,
         quick_questions=[

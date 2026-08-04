@@ -1,15 +1,9 @@
-"""轻量 RAG：对 Markdown 做章节感知分块，并用字段加权 BM25 检索。
-
-设计取舍：DeepSeek 等常用服务不提供 Embedding 接口，因此本项目采用
-「中文二元组 + 英文单词」的词汇级 BM25 检索，并对文档标题、章节标题、
-正文设置不同权重。索引在文档加载时一次构建，查询只遍历命中词的倒排列表，
-适合资源受限的 k3s 部署。
-
-若日后接入 Embedding 服务，可在此模块基础上增加向量检索实现。
-"""
+"""混合 RAG：章节感知分块、BM25、稀疏向量召回与可解释重排。"""
 
 import math
 import re
+import zlib
+from array import array
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,6 +20,8 @@ _HEADING_WEIGHT = 2.5
 _EXPANSION_WEIGHT = 0.65
 _MIN_ORIGINAL_QUERY_COVERAGE = 0.25
 _MIN_EXPANSION_MATCHES = 2
+_RRF_K = 60
+_VECTOR_DIMENSIONS = 256
 # 只允许安全的 Markdown 文件名：字母/数字/中文/下划线/连字符 + .md，禁止路径穿越。
 _SAFE_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff][\w\u4e00-\u9fff\-]*\.md$")
 
@@ -64,6 +60,7 @@ class RetrievedChunk:
     heading: str
     content: str
     score: float
+    retrieval: str = "hybrid"
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +91,15 @@ def tokenize(text: str) -> list[str]:
         for i in range(len(run) - 1):
             tokens.append(run[i : i + 2])
     return tokens
+
+
+def _vector_bucket(term: str) -> tuple[int, float]:
+    """Feature hashing：把任意词项稳定映射到固定维度，控制大知识库内存。"""
+
+    digest = zlib.crc32(term.encode("utf-8"))
+    bucket = digest % _VECTOR_DIMENSIONS
+    sign = -1.0 if digest & 0x80000000 else 1.0
+    return bucket, sign
 
 
 def _split_sections(text: str) -> list[tuple[str, str]]:
@@ -150,18 +156,27 @@ def _chunk_section(heading: str, body: str) -> list[tuple[str, str]]:
 
 
 class KnowledgeBase:
-    """加载知识库文档并做 BM25 检索。"""
+    """加载文档并执行 BM25 + 稀疏向量 + 规则重排的混合检索。"""
 
     def __init__(
-        self, docs_dir: str | Path, top_k: int = 3, min_score: float = 0.0
+        self,
+        docs_dir: str | Path,
+        top_k: int = 3,
+        min_score: float = 0.0,
+        candidate_k: int = 24,
+        vector_weight: float = 0.4,
     ) -> None:
         self.docs_dir = Path(docs_dir)
         self.top_k = top_k
         self.min_score = min_score
+        self.candidate_k = max(candidate_k, top_k)
+        self.vector_weight = min(max(vector_weight, 0.0), 1.0)
         self.chunks: list[KnowledgeChunk] = []
         self._index: dict[str, list[tuple[int, float]]] = {}
         self._doc_len: list[float] = []
         self._source_indices: dict[str, set[int]] = {}
+        self._vectors: list[array] = []
+        self._vector_idf: dict[str, float] = {}
         self._avgdl = 0.0
         self._logger = get_logger()
 
@@ -180,6 +195,8 @@ class KnowledgeBase:
         self._index = defaultdict(list)
         self._doc_len = []
         self._source_indices = defaultdict(set)
+        self._vectors = []
+        self._vector_idf = {}
         self._avgdl = 0.0
         if not self.docs_dir.is_dir():
             self._logger.warning("rag_no_dir", extra={"dir": str(self.docs_dir)})
@@ -208,6 +225,30 @@ class KnowledgeBase:
                         self._index[term].append((chunk_index, float(count)))
 
         self._avgdl = sum(self._doc_len) / len(self._doc_len) if self._doc_len else 0.0
+        # 本地稀疏向量通道：TF-IDF L2 归一化后建立倒排表。它不依赖外部
+        # Embedding 服务，生产环境可在保持相同接口的前提下替换为稠密向量库。
+        vector_df: Counter[str] = Counter()
+        for chunk in self.chunks:
+            vector_df.update(
+                set(tokenize(f"{chunk.source} {chunk.heading} {chunk.content}"))
+            )
+        vector_count = max(len(self.chunks), 1)
+        self._vector_idf = {
+            term: math.log((vector_count + 1) / (df + 1)) + 1.0
+            for term, df in vector_df.items()
+        }
+        for chunk in self.chunks:
+            frequencies = Counter(
+                tokenize(f"{chunk.source} {chunk.heading} {chunk.content}")
+            )
+            vector = array("f", [0.0]) * _VECTOR_DIMENSIONS
+            for term, count in frequencies.items():
+                bucket, sign = _vector_bucket(term)
+                vector[bucket] += sign * (
+                    (1.0 + math.log(count)) * self._vector_idf[term]
+                )
+            norm = math.sqrt(sum(weight * weight for weight in vector)) or 1.0
+            self._vectors.append(array("f", (weight / norm for weight in vector)))
         self._logger.info(
             "rag_loaded",
             extra={"docs": self.document_count, "chunks": len(self.chunks)},
@@ -235,7 +276,7 @@ class KnowledgeBase:
         k: int | None = None,
         doc: str | None = None,
     ) -> list[RetrievedChunk]:
-        """BM25 检索 top-k；可按文档名过滤，返回按相关性降序的分块。"""
+        """混合召回并重排 top-k；可按文档名过滤。"""
 
         if not self.chunks:
             return []
@@ -253,8 +294,7 @@ class KnowledgeBase:
         if doc and not allowed_indices:
             return []
 
-        # 直接复用加载阶段构建的全局倒排索引；查询复杂度取决于命中 posting，
-        # 不再随知识库总分块数线性重建索引。
+        # 第一通道：字段加权 BM25。
         n = len(self.chunks)
         scores: dict[int, float] = defaultdict(float)
         matched_query_terms: dict[int, set[str]] = defaultdict(set)
@@ -277,7 +317,35 @@ class KnowledgeBase:
                 scores[doc_idx] += query_weight * idf * (tf * (_K1 + 1.0)) / denom
                 matched_query_terms[doc_idx].add(term)
 
-        if not scores:
+        # 第二通道：TF-IDF 稀疏向量余弦相似度。查询同样使用领域扩展词，
+        # 但保持较低权重，避免同义词覆盖用户原始表达。
+        vector_query: dict[int, float] = defaultdict(float)
+        for term, query_weight in query_terms.items():
+            idf = self._vector_idf.get(term)
+            if idf is not None:
+                bucket, sign = _vector_bucket(term)
+                vector_query[bucket] += sign * query_weight * idf
+        query_norm = (
+            math.sqrt(sum(weight * weight for weight in vector_query.values())) or 1.0
+        )
+        vector_scores: dict[int, float] = defaultdict(float)
+        candidate_indices = (
+            allowed_indices
+            if allowed_indices is not None
+            else range(len(self._vectors))
+        )
+        normalized_query = {
+            bucket: weight / query_norm for bucket, weight in vector_query.items()
+        }
+        for doc_idx in candidate_indices:
+            score = sum(
+                weight * self._vectors[doc_idx][bucket]
+                for bucket, weight in normalized_query.items()
+            )
+            if score > 0:
+                vector_scores[doc_idx] = score
+
+        if not scores and not vector_scores:
             return []
 
         # 查询词覆盖率作为温和校准项：避免只碰巧命中一个高频词的长段落排到前面。
@@ -287,14 +355,45 @@ class KnowledgeBase:
             coverage = len(matched_original) / original_term_count
             scores[doc_idx] *= 0.75 + 0.25 * coverage
 
-        ranked = sorted(scores, key=scores.__getitem__, reverse=True)
+        # Reciprocal Rank Fusion 产生候选集，对两路分数尺度不敏感。
+        bm25_ranked = sorted(scores, key=scores.__getitem__, reverse=True)[
+            : self.candidate_k
+        ]
+        vector_ranked = sorted(
+            vector_scores, key=vector_scores.__getitem__, reverse=True
+        )[: self.candidate_k]
+        fused: dict[int, float] = defaultdict(float)
+        lexical_weight = 1.0 - self.vector_weight
+        for rank, doc_idx in enumerate(bm25_ranked, 1):
+            fused[doc_idx] += lexical_weight / (_RRF_K + rank)
+        for rank, doc_idx in enumerate(vector_ranked, 1):
+            fused[doc_idx] += self.vector_weight / (_RRF_K + rank)
+
+        # 可解释重排：融合分数之外，显式奖励原查询覆盖率、标题命中和向量相似度。
+        max_bm25 = max(scores.values(), default=1.0) or 1.0
+        reranked_scores: dict[int, float] = {}
+        for doc_idx, rrf_score in fused.items():
+            matched_original = matched_query_terms[doc_idx] & original_terms
+            coverage = len(matched_original) / original_term_count
+            heading_terms = set(tokenize(self.chunks[doc_idx].heading))
+            heading_coverage = len(heading_terms & original_terms) / original_term_count
+            reranked_scores[doc_idx] = (
+                rrf_score * 30.0
+                + 0.42 * (scores.get(doc_idx, 0.0) / max_bm25)
+                + 0.28 * vector_scores.get(doc_idx, 0.0)
+                + 0.20 * coverage
+                + 0.10 * heading_coverage
+            )
+
+        ranked = sorted(reranked_scores, key=reranked_scores.__getitem__, reverse=True)
         results: list[RetrievedChunk] = []
         for idx in ranked:
             # 全局检索时，低于最低相关度阈值视为噪音直接截断（分数降序）。
             # 显式按单篇文档过滤时视为用户明确意图，不套全局阈值；但由于候选分块
             # 来自命中词的 posting，仍不会返回完全不相关的内容。
-            if doc is None and scores[idx] <= self.min_score:
-                break
+            raw_bm25 = scores.get(idx, 0.0)
+            if doc is None and raw_bm25 <= self.min_score:
+                continue
             if doc is None:
                 matched_original = matched_query_terms[idx] & original_terms
                 original_coverage = len(matched_original) / original_term_count
@@ -306,7 +405,13 @@ class KnowledgeBase:
                     continue
             chunk = self.chunks[idx]
             results.append(
-                RetrievedChunk(chunk.source, chunk.heading, chunk.content, scores[idx])
+                RetrievedChunk(
+                    chunk.source,
+                    chunk.heading,
+                    chunk.content,
+                    reranked_scores[idx],
+                    "bm25+tfidf+rerank",
+                )
             )
             if len(results) >= limit:
                 break

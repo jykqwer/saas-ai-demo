@@ -81,6 +81,7 @@ class RetrieveResult(BaseModel):
     heading: str
     content: str
     score: float
+    retrieval: str = "hybrid"
 
 
 class RetrieveResponse(BaseModel):
@@ -231,6 +232,7 @@ async def retrieve_docs(
                 heading=r.heading,
                 content=r.content,
                 score=round(r.score, 3),
+                retrieval=r.retrieval,
             )
             for r in results
         ],

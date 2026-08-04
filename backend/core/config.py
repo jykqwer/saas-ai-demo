@@ -28,6 +28,8 @@ DEFAULT_DATABASE_HEALTH_TIMEOUT_SECONDS = 2.0
 DEFAULT_USER_DAILY_QUESTION_LIMIT = 10
 DEFAULT_AUTH_SESSION_TTL_HOURS = 24
 DEFAULT_QUOTA_TIMEZONE = "Asia/Shanghai"
+DEFAULT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_QWEN_VISION_MODEL = "qwen3.7-plus"
 
 
 def _parse_origins(raw_origins: str | None) -> tuple[str, ...]:
@@ -89,6 +91,11 @@ class Settings:
     llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES
     llm_retry_base_delay_seconds: float = DEFAULT_LLM_RETRY_BASE_DELAY_SECONDS
 
+    # 多模态路由：消息包含图片时使用 Qwen3.7-Plus；未配置 Key 时拒绝图片请求。
+    qwen_api_key: str | None = None
+    qwen_base_url: str = DEFAULT_QWEN_BASE_URL
+    qwen_vision_model: str = DEFAULT_QWEN_VISION_MODEL
+
     # SaaS 产品与公司信息，用于构建系统提示词和前端引导。
     saas_product_name: str = DEFAULT_SAAS_PRODUCT_NAME
     saas_company_name: str = DEFAULT_SAAS_COMPANY_NAME
@@ -111,6 +118,8 @@ class Settings:
     rag_top_k: int = 3
     # BM25 字符大粒匹配噪音较多，阈值只过滤明显无关（0.9 以下）片段。
     rag_min_score: float = 1.0
+    rag_candidate_k: int = 24
+    rag_vector_weight: float = 0.4
     rag_knowledge_base_dir: str = "knowledge_base"
 
     # 网络搜索：让模型在知识库之外也能通过工具调用联网查询。
@@ -142,6 +151,12 @@ class Settings:
             raise ValueError(
                 f"Unsupported web search provider: {self.web_search_provider}"
             )
+        if self.rag_candidate_k < self.rag_top_k:
+            raise ValueError(
+                "RAG_CANDIDATE_K must be greater than or equal to RAG_TOP_K"
+            )
+        if not 0.0 <= self.rag_vector_weight <= 1.0:
+            raise ValueError("RAG_VECTOR_WEIGHT must be between 0 and 1")
 
         # 显式指定 Psycopg 3 方言，确保异步运行时和同步迁移使用同一种驱动。
         if self.database_url is not None and not self.database_url.startswith(
@@ -183,6 +198,8 @@ class Settings:
         # 未配置 Key 时进入演示模式，base_url 仍须是合法 URL 以便展示接入示例。
         elif not self.llm_base_url.startswith(("http://", "https://")):
             raise ValueError("LLM_BASE_URL must be an http(s) URL")
+        if not self.qwen_base_url.startswith(("http://", "https://")):
+            raise ValueError("QWEN_BASE_URL must be an http(s) URL")
 
     @property
     def llm_configured(self) -> bool:
@@ -222,6 +239,9 @@ def _build_settings() -> Settings:
             os.getenv("LLM_RETRY_BASE_DELAY_SECONDS"),
             DEFAULT_LLM_RETRY_BASE_DELAY_SECONDS,
         ),
+        qwen_api_key=os.getenv("QWEN_API_KEY") or None,
+        qwen_base_url=os.getenv("QWEN_BASE_URL", DEFAULT_QWEN_BASE_URL).rstrip("/"),
+        qwen_vision_model=os.getenv("QWEN_VISION_MODEL", DEFAULT_QWEN_VISION_MODEL),
         saas_product_name=os.getenv("SAAS_PRODUCT_NAME", DEFAULT_SAAS_PRODUCT_NAME),
         saas_company_name=os.getenv("SAAS_COMPANY_NAME", DEFAULT_SAAS_COMPANY_NAME),
         database_url=os.getenv("DATABASE_URL") or None,
@@ -251,6 +271,10 @@ def _build_settings() -> Settings:
         rag_enabled=_parse_bool("RAG_ENABLED", os.getenv("RAG_ENABLED"), True),
         rag_top_k=_parse_int("RAG_TOP_K", os.getenv("RAG_TOP_K"), 3),
         rag_min_score=_parse_float("RAG_MIN_SCORE", os.getenv("RAG_MIN_SCORE"), 1.0),
+        rag_candidate_k=_parse_int("RAG_CANDIDATE_K", os.getenv("RAG_CANDIDATE_K"), 24),
+        rag_vector_weight=_parse_float(
+            "RAG_VECTOR_WEIGHT", os.getenv("RAG_VECTOR_WEIGHT"), 0.4
+        ),
         rag_knowledge_base_dir=os.getenv("RAG_KNOWLEDGE_BASE_DIR", "knowledge_base"),
         web_search_enabled=_parse_bool(
             "WEB_SEARCH_ENABLED", os.getenv("WEB_SEARCH_ENABLED"), True

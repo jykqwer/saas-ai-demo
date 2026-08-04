@@ -13,11 +13,16 @@ services:
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
       LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
       LLM_RETRY_BASE_DELAY_SECONDS: ${LLM_RETRY_BASE_DELAY_SECONDS:-0.5}
+      QWEN_API_KEY: ${QWEN_API_KEY:-}
+      QWEN_BASE_URL: ${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      QWEN_VISION_MODEL: ${QWEN_VISION_MODEL:-qwen3.7-plus}
       SAAS_PRODUCT_NAME: ${SAAS_PRODUCT_NAME:-云枢 CloudHub}
       SAAS_COMPANY_NAME: ${SAAS_COMPANY_NAME:-云枢科技}
       # RAG 知识库：目录随后端镜像/挂载进入 /app/knowledge_base。
       RAG_ENABLED: ${RAG_ENABLED:-true}
       RAG_TOP_K: ${RAG_TOP_K:-3}
+      RAG_CANDIDATE_K: ${RAG_CANDIDATE_K:-24}
+      RAG_VECTOR_WEIGHT: ${RAG_VECTOR_WEIGHT:-0.4}
       # 网络搜索：模型按需联网查询。
       WEB_SEARCH_ENABLED: ${WEB_SEARCH_ENABLED:-true}
       WEB_SEARCH_PROVIDER: ${WEB_SEARCH_PROVIDER:-tavily}

@@ -1,0 +1,8 @@
+{"query":"标准版多少钱","expected_source":"pricing","heading_contains":"标准版","relevant":true}
+{"query":"可以免费试用多久","expected_source":"faq","heading_contains":"试用","relevant":true}
+{"query":"支持部署到自己的 Kubernetes 吗","expected_source":"deployment","heading_contains":"私有化","relevant":true}
+{"query":"客户数据会不会泄露","expected_source":"security","heading_contains":"安全","relevant":true}
+{"query":"如何通过 Webhook 对接","expected_source":"api-integration","heading_contains":"Webhook","relevant":true}
+{"query":"忘记密码怎么办","expected_source":"faq","heading_contains":"密码","relevant":true}
+{"query":"今天天气怎么样","relevant":false}
+{"query":"退款政策是什么","relevant":false}

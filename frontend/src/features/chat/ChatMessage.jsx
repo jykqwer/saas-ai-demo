@@ -46,6 +46,13 @@ export default function ChatMessage({ message, onOpenSource }) {
         {isUser ? '我' : '枢'}
       </div>
       <div className="msg-body">
+        {isUser && message.images?.length > 0 && (
+          <div className="message-images">
+            {message.images.map((url, index) => (
+              <img src={url} alt={`用户上传 ${index + 1}`} key={index} />
+            ))}
+          </div>
+        )}
         {message.webSearch && !isUser && (
           <div className="web-badge">
             🌐 已联网查询「{message.webSearch}」{webCountLabel}

@@ -100,6 +100,16 @@ def _split_mock_chunks(text: str, max_chunk: int = 24) -> list[str]:
     return chunks
 
 
+def _trim_context(messages: list[dict], max_context_turns: int) -> list[dict]:
+    """保留 system 提示与最近历史，且不重复首条消息。"""
+
+    if not messages:
+        return []
+    if messages[0].get("role") == "system":
+        return messages[:1] + messages[1:][-max_context_turns:]
+    return messages[-max_context_turns:]
+
+
 # 模型偶发把工具调用"写成文本"（而非结构化 tool_calls 字段）时的解析。
 # 兼容普通 <invoke>、Anthropic 风格 <antml:invoke>，以及 DeepSeek 偶发泄漏的
 # <｜｜DSML｜｜invoke>（也兼容半角竖线版本）。
@@ -370,7 +380,7 @@ class LLMClient:
             return self._mock_chat(messages, request_id, rag_chunks)
 
         # 只发送最近 N 轮（保留 system 消息），控制请求体积。
-        context = messages[:1] + messages[-self.max_context_turns :]
+        context = _trim_context(messages, self.max_context_turns)
 
         payload = {
             "model": self.model,
@@ -502,9 +512,17 @@ class LLMClient:
         """
 
         if not self.configured:
-            last_user = next(
+            last_user_content = next(
                 (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
             )
+            if isinstance(last_user_content, list):
+                last_user = " ".join(
+                    str(part.get("text", ""))
+                    for part in last_user_content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+            else:
+                last_user = str(last_user_content)
             text = self._mock_reply(last_user, rag_chunks)
             get_logger().info(
                 "llm_mock_stream",
@@ -520,7 +538,7 @@ class LLMClient:
                 await asyncio.sleep(0.012)
             return
 
-        context = messages[:1] + messages[-self.max_context_turns :]
+        context = _trim_context(messages, self.max_context_turns)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": context,
@@ -709,9 +727,17 @@ class LLMClient:
     ) -> LLMResult:
         """演示模式：优先用知识库检索结果，否则基于关键词回复。"""
 
-        last_user = next(
+        last_user_content = next(
             (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
         )
+        if isinstance(last_user_content, list):
+            last_user = " ".join(
+                str(part.get("text", ""))
+                for part in last_user_content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        else:
+            last_user = str(last_user_content)
         get_logger().info(
             "llm_mock",
             extra={

@@ -10,7 +10,7 @@ from infrastructure.web_search import WebSearchClient
 def _run(coro):
     import asyncio
 
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def test_tavily_parsing_and_auth() -> None:

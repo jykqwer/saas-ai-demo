@@ -13,12 +13,15 @@
 - ⚡ **流式输出（SSE）**：助手回复逐字呈现，体验接近真实大模型
 - 🧭 引导与快捷问题：欢迎语、5 个售前快捷问题、快捷入口
 - 🗂 **会话持久化（PostgreSQL）**：会话与消息落库，刷新/重启不丢失，侧边栏会话历史可回看
-- 📚 **RAG 知识库检索**：章节感知分块 + 字段加权 BM25 + 领域查询扩展，零外部 Embedding 依赖；[查看优化报告与量化指标](./docs/rag-improvement-report.md)
+- 📚 **混合 RAG**：章节感知分块 + BM25 + TF-IDF 向量召回 + RRF/规则重排，并提供 Recall@K、MRR、拒答准确率评测
 - 🌐 **联网查询**：知识库之外的问题，模型通过 `web_search` 工具自动联网检索并基于结果作答（DuckDuckGo/Wikipedia，无需额外 Key），展示可点击的来源链接
 - 🎛 **查询模式**：头部开关「智能（按需联网）/ 始终联网 / 仅知识库」
 - 👋 **人工转接**：一键转人工，填写联系方式生成工单
 - 🧪 演示模式：无 Key 也能完整体验，界面标注「演示模式」
 - 🤖 真实大模型：配置 `LLM_API_KEY` 后接入，上下文裁剪、超时与错误处理
+- 🧩 **工具平台**：统一注册工具 Schema、执行器和模式权限，LLM 动态决定是否调用 RAG/联网工具
+- 🧭 **持久化 Agent 编排**：Run/Step/Event 状态机记录每轮模型与工具调用，可通过 API 查看完整 Trace
+- 🖼 **Qwen 图文理解**：配置 `QWEN_API_KEY` 后，包含图片的消息自动路由到 `qwen3.7-plus`
 - 🏷 状态徽标：实时显示「已接入大模型 / 演示模式」与模型名
 - 🚢 部署：Docker Compose（本地）+ k3s 清单（生产）
 
@@ -97,6 +100,9 @@ npm run build
 | `LLM_MAX_CONTEXT_TURNS` | `12` | 发送给模型的最近对话轮数上限 |
 | `LLM_MAX_RETRIES` | `2` | 遇到 408、425、429、5xx 或网络错误时的最大重试次数 |
 | `LLM_RETRY_BASE_DELAY_SECONDS` | `0.5` | 指数退避的初始等待秒数 |
+| `QWEN_API_KEY` | 空 | 阿里云百炼 Key；配置后启用图片理解 |
+| `QWEN_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 百炼 OpenAI 兼容接口 |
+| `QWEN_VISION_MODEL` | `qwen3.7-plus` | 图片消息使用的视觉模型 |
 | `SAAS_PRODUCT_NAME` | `云枢 CloudHub` | 产品名（进入系统提示词） |
 | `SAAS_COMPANY_NAME` | `云枢科技` | 公司名 |
 | `DATABASE_URL` | 空（内存仓库） | 会话持久化连接串，必须 `postgresql+psycopg://` |
@@ -111,6 +117,8 @@ npm run build
 | `RAG_TOP_K` | `3` | 每次检索注入的分块数 |
 | `RAG_MIN_SCORE` | `1.0` | 全局检索的最低相关度阈值，过滤明显无关片段；显式按文档过滤时不生效 |
 | `RAG_KNOWLEDGE_BASE_DIR` | `knowledge_base` | 知识库 Markdown 目录 |
+| `RAG_CANDIDATE_K` | `24` | 两路召回进入融合重排的候选数 |
+| `RAG_VECTOR_WEIGHT` | `0.4` | RRF 中向量召回通道的权重 |
 | `WEB_SEARCH_ENABLED` | `true` | 是否允许模型联网查询 |
 | `WEB_SEARCH_PROVIDER` | `tavily` | 搜索提供方：`tavily` / `wikipedia` / `auto` |
 | `TAVILY_API_KEY` | 空 | Tavily Search API Key；provider 为 `tavily` 时必需 |
@@ -119,8 +127,17 @@ npm run build
 | `LOG_LEVEL` | `INFO` | 结构化日志级别 |
 
 **RAG 说明**：知识库位于 `backend/knowledge_base/*.md`（产品、价格、部署、安全、API、FAQ）。
-启动时加载并按章节路径分块、建立字段加权 BM25 倒排索引；每次提问检索最相关分块注入系统提示词，
+启动时加载并按章节路径分块，同时建立字段加权 BM25 与归一化 TF-IDF 稀疏向量索引；查询先做双路召回，
+再通过 RRF、查询覆盖率、标题命中和向量相似度重排；每次提问检索最相关分块注入系统提示词，
 让大模型基于真实资料回答（演示模式同样走检索）。切换服务商或换模型只需改 `.env`。
+
+运行可重复的 RAG 质量评测：
+
+```bash
+python scripts/evaluate-rag.py
+```
+
+评测集为 `backend/rag_evalset.jsonl`，输出 Recall@K、MRR、拒答准确率和检索延迟。
 
 **数据库说明**：未配置 `DATABASE_URL` 时使用内存仓库（本地联调、测试）；
 配置后使用 PostgreSQL 持久化（compose 与 k3s 均已内置）。Compose 会在后端启动前
@@ -156,8 +173,8 @@ docker compose exec backend alembic -c alembic.ini upgrade head
 | GET | `/api/v1/admin/users` | 用户列表（仅 superuser） |
 | POST | `/api/v1/admin/users/{id}/approve` | 通过注册申请（仅 superuser） |
 | POST | `/api/v1/admin/users/{id}/reject` | 拒绝注册申请（仅 superuser） |
-| POST | `/api/v1/chat` | 非流式对话（`content` + 可选 `session_id`） |
-| POST | `/api/v1/chat/stream` | SSE 流式对话（`meta` / `delta` / `done` / `error` 事件） |
+| POST | `/api/v1/chat` | 非流式对话（`content` + 可选 `session_id` / `images`） |
+| POST | `/api/v1/chat/stream` | SSE 流式对话（支持 `images`，返回 `meta` / `delta` / `done` / `error`） |
 | POST | `/api/v1/chat/handoff` | 创建人工转接工单 |
 | GET | `/api/v1/chat/config` | 引导配置（问候语、快捷问题、接入状态） |
 | GET | `/api/v1/sessions` | 会话列表 |
@@ -168,6 +185,7 @@ docker compose exec backend alembic -c alembic.ini upgrade head
 | POST | `/api/v1/knowledge/docs` | 导入/覆盖文档（`filename` + `content`） |
 | DELETE | `/api/v1/knowledge/docs/{name}` | 删除文档 |
 | POST | `/api/v1/knowledge/retrieve` | 检索测试：返回命中的分块（来源/标题/相关度），不调用大模型 |
+| GET | `/api/v1/runs/{id}` | 查看持久化 Agent Run、模型/工具 Steps 与事件轨迹 |
 | GET | `/api/v1/health/live` `ready` | 存活与就绪检查 |
 
 **知识库管理**：前端侧边栏「📚 知识库管理」可在线查看、导入（选文件或粘贴 Markdown）、

@@ -380,6 +380,25 @@
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+.sources-toggle {
+  margin-top: 7px;
+  padding: 3px 0;
+  border: 0;
+  background: transparent;
+  color: #a5b4fc;
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.sources-toggle:hover {
+  color: #c7d2fe;
+  text-decoration: underline;
+}
+.sources-toggle:focus-visible {
+  outline: 2px solid var(--indigo);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
 
 /* 模式开关 */
 .header-actions {

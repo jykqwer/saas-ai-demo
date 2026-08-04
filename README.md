@@ -95,6 +95,8 @@ npm run build
 | `LLM_MODEL` | `deepseek-chat` | 模型名 |
 | `LLM_TIMEOUT_SECONDS` | `60` | 上游调用超时 |
 | `LLM_MAX_CONTEXT_TURNS` | `12` | 发送给模型的最近对话轮数上限 |
+| `LLM_MAX_RETRIES` | `2` | 遇到 408、425、429、5xx 或网络错误时的最大重试次数 |
+| `LLM_RETRY_BASE_DELAY_SECONDS` | `0.5` | 指数退避的初始等待秒数 |
 | `SAAS_PRODUCT_NAME` | `云枢 CloudHub` | 产品名（进入系统提示词） |
 | `SAAS_COMPANY_NAME` | `云枢科技` | 公司名 |
 | `DATABASE_URL` | 空（内存仓库） | 会话持久化连接串，必须 `postgresql+psycopg://` |

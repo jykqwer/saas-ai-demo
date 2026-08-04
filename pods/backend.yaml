@@ -79,6 +79,10 @@ spec:
                 secretKeyRef:
                   name: llm-credentials
                   key: LLM_MODEL
+            - name: LLM_MAX_RETRIES
+              value: "2"
+            - name: LLM_RETRY_BASE_DELAY_SECONDS
+              value: "0.5"
             # 会话持久化连接串来自数据库凭据 Secret。
             - name: DATABASE_URL
               valueFrom:

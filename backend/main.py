@@ -83,6 +83,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         model=resolved_settings.llm_model,
         timeout_seconds=resolved_settings.llm_timeout_seconds,
         max_context_turns=resolved_settings.llm_max_context_turns,
+        max_retries=resolved_settings.llm_max_retries,
+        retry_base_delay_seconds=resolved_settings.llm_retry_base_delay_seconds,
         mock_reply=lambda question, rag_chunks: build_mock_reply(
             question,
             assistant_profile,

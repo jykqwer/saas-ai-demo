@@ -20,6 +20,8 @@ DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
 DEFAULT_LLM_MODEL = "deepseek-chat"
 DEFAULT_LLM_TIMEOUT_SECONDS = 60.0
 DEFAULT_LLM_MAX_CONTEXT_TURNS = 12
+DEFAULT_LLM_MAX_RETRIES = 2
+DEFAULT_LLM_RETRY_BASE_DELAY_SECONDS = 0.5
 DEFAULT_SAAS_PRODUCT_NAME = "云枢 CloudHub"
 DEFAULT_SAAS_COMPANY_NAME = "云枢科技"
 DEFAULT_DATABASE_HEALTH_TIMEOUT_SECONDS = 2.0
@@ -84,6 +86,8 @@ class Settings:
     llm_model: str = DEFAULT_LLM_MODEL
     llm_timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS
     llm_max_context_turns: int = DEFAULT_LLM_MAX_CONTEXT_TURNS
+    llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES
+    llm_retry_base_delay_seconds: float = DEFAULT_LLM_RETRY_BASE_DELAY_SECONDS
 
     # SaaS 产品与公司信息，用于构建系统提示词和前端引导。
     saas_product_name: str = DEFAULT_SAAS_PRODUCT_NAME
@@ -130,6 +134,10 @@ class Settings:
             raise ValueError("LLM_TIMEOUT_SECONDS must be positive")
         if self.llm_max_context_turns <= 0:
             raise ValueError("LLM_MAX_CONTEXT_TURNS must be positive")
+        if self.llm_max_retries < 0:
+            raise ValueError("LLM_MAX_RETRIES must be zero or positive")
+        if self.llm_retry_base_delay_seconds < 0:
+            raise ValueError("LLM_RETRY_BASE_DELAY_SECONDS must be zero or positive")
         if self.web_search_provider not in {"tavily", "wikipedia", "auto"}:
             raise ValueError(
                 f"Unsupported web search provider: {self.web_search_provider}"
@@ -203,6 +211,16 @@ def _build_settings() -> Settings:
             "LLM_MAX_CONTEXT_TURNS",
             os.getenv("LLM_MAX_CONTEXT_TURNS"),
             DEFAULT_LLM_MAX_CONTEXT_TURNS,
+        ),
+        llm_max_retries=_parse_int(
+            "LLM_MAX_RETRIES",
+            os.getenv("LLM_MAX_RETRIES"),
+            DEFAULT_LLM_MAX_RETRIES,
+        ),
+        llm_retry_base_delay_seconds=_parse_float(
+            "LLM_RETRY_BASE_DELAY_SECONDS",
+            os.getenv("LLM_RETRY_BASE_DELAY_SECONDS"),
+            DEFAULT_LLM_RETRY_BASE_DELAY_SECONDS,
         ),
         saas_product_name=os.getenv("SAAS_PRODUCT_NAME", DEFAULT_SAAS_PRODUCT_NAME),
         saas_company_name=os.getenv("SAAS_COMPANY_NAME", DEFAULT_SAAS_COMPANY_NAME),

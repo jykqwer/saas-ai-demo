@@ -7,6 +7,7 @@
 - 不把 Key 写入日志；错误消息只描述失败类别，不回显上游原始响应体。
 - 对上下文长度做上限约束（按对话轮数裁剪），防止请求体无界增长。
 - 提供流式接口：真实模式解析上游 SSE，演示模式模拟逐字输出。
+- 对限流、5xx 和网络抖动做指数退避；流式内容已下发后不重试，避免重复文本。
 """
 
 import asyncio
@@ -291,13 +292,21 @@ class LLMClient:
         model: str,
         timeout_seconds: float,
         max_context_turns: int,
+        max_retries: int = 2,
+        retry_base_delay_seconds: float = 0.5,
         mock_reply: Any,
     ) -> None:
+        if max_retries < 0:
+            raise ValueError("max_retries must be zero or positive")
+        if retry_base_delay_seconds < 0:
+            raise ValueError("retry_base_delay_seconds must be zero or positive")
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.max_context_turns = max_context_turns
+        self.max_retries = max_retries
+        self.retry_base_delay_seconds = retry_base_delay_seconds
         self._mock_reply = mock_reply
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_seconds),
@@ -314,6 +323,39 @@ class LLMClient:
 
     async def close(self) -> None:
         await self._http.aclose()
+
+    @staticmethod
+    def _is_retryable_status(status_code: int) -> bool:
+        """只重试限流、临时请求超时和服务端错误。"""
+
+        return status_code in {408, 425, 429} or 500 <= status_code <= 599
+
+    async def _wait_before_retry(
+        self,
+        *,
+        attempt: int,
+        request_id: str,
+        reason: str,
+        status_code: int | None = None,
+    ) -> None:
+        """按 0.5s、1s、2s…指数退避，并记录不含响应体的结构化日志。"""
+
+        delay = self.retry_base_delay_seconds * (2**attempt)
+        get_logger().warning(
+            "llm_retry",
+            extra={
+                "request_id": request_id,
+                "provider": self.provider,
+                "model": self.model,
+                "reason": reason,
+                "status_code": status_code,
+                "retry_number": attempt + 1,
+                "max_retries": self.max_retries,
+                "delay_seconds": delay,
+            },
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     async def chat(
         self,
@@ -339,34 +381,67 @@ class LLMClient:
         }
 
         started = __import__("time").perf_counter()
-        try:
-            response = await self._http.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-            )
-        except httpx.TimeoutException as exc:
-            get_logger().warning(
-                "llm_timeout",
-                extra={
-                    "request_id": request_id,
-                    "provider": self.provider,
-                    "model": self.model,
-                },
-            )
-            raise ChatProviderError(
-                code="LLM_TIMEOUT",
-                message="The AI provider did not respond in time.",
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise ChatProviderError(
-                code="LLM_NETWORK_ERROR",
-                message="Failed to reach the AI provider.",
-            ) from exc
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = await self._http.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+            except httpx.TimeoutException as exc:
+                if attempt < self.max_retries:
+                    await self._wait_before_retry(
+                        attempt=attempt,
+                        request_id=request_id,
+                        reason="timeout",
+                    )
+                    continue
+                get_logger().warning(
+                    "llm_timeout",
+                    extra={
+                        "request_id": request_id,
+                        "provider": self.provider,
+                        "model": self.model,
+                        "attempts": attempt + 1,
+                    },
+                )
+                raise ChatProviderError(
+                    code="LLM_TIMEOUT",
+                    message="The AI provider did not respond in time.",
+                ) from exc
+            except httpx.TransportError as exc:
+                if attempt < self.max_retries:
+                    await self._wait_before_retry(
+                        attempt=attempt,
+                        request_id=request_id,
+                        reason="network_error",
+                    )
+                    continue
+                raise ChatProviderError(
+                    code="LLM_NETWORK_ERROR",
+                    message="Failed to reach the AI provider.",
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise ChatProviderError(
+                    code="LLM_NETWORK_ERROR",
+                    message="Failed to reach the AI provider.",
+                ) from exc
 
-        latency_ms = int((__import__("time").perf_counter() - started) * 1000)
+            if response.status_code == 200:
+                break
+            if (
+                self._is_retryable_status(response.status_code)
+                and attempt < self.max_retries
+            ):
+                await self._wait_before_retry(
+                    attempt=attempt,
+                    request_id=request_id,
+                    reason="http_status",
+                    status_code=response.status_code,
+                )
+                continue
 
-        if response.status_code != 200:
+            latency_ms = int((__import__("time").perf_counter() - started) * 1000)
             get_logger().warning(
                 "llm_http_error",
                 extra={
@@ -375,12 +450,15 @@ class LLMClient:
                     "model": self.model,
                     "status_code": response.status_code,
                     "latency_ms": latency_ms,
+                    "attempts": attempt + 1,
                 },
             )
             raise ChatProviderError(
                 code="LLM_UPSTREAM_ERROR",
                 message="The AI provider returned an error.",
             )
+
+        latency_ms = int((__import__("time").perf_counter() - started) * 1000)
 
         try:
             data = response.json()
@@ -454,87 +532,135 @@ class LLMClient:
         if tools:
             payload["tools"] = tools
 
-        tool_calls: dict[int, dict[str, str]] = {}
-        reasoning_parts: list[str] = []
-        # 保留原文用于流结束后识别文本化工具调用；可见普通文本经增量过滤后立即下发。
-        content_parts: list[str] = []
-        visible_filter = _VisibleContentFilter()
-        try:
-            async with self._http.stream(
-                "POST",
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-            ) as response:
-                if response.status_code != 200:
-                    get_logger().warning(
-                        "llm_stream_http_error",
-                        extra={
-                            "request_id": request_id,
-                            "provider": self.provider,
-                            "model": self.model,
-                            "status_code": response.status_code,
-                        },
-                    )
-                    raise ChatProviderError(
-                        code="LLM_UPSTREAM_ERROR",
-                        message="The AI provider returned an error.",
-                    )
-
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        choice = json.loads(data)["choices"][0]
-                    except (KeyError, IndexError, TypeError, ValueError):
-                        continue
-                    delta = choice.get("delta", {})
-                    content = delta.get("content")
-                    if content:
-                        content_parts.append(content)
-                        for visible_text in visible_filter.feed(content):
-                            if visible_text:
-                                yield StreamEvent(kind="delta", text=visible_text)
-                    # 推理型模型的思考内容：需要随工具调用一并回传。
-                    reasoning = delta.get("reasoning_content")
-                    if reasoning:
-                        reasoning_parts.append(reasoning)
-                    for tool_call in delta.get("tool_calls") or []:
-                        idx = int(tool_call.get("index", 0))
-                        entry = tool_calls.setdefault(
-                            idx, {"id": "", "name": "", "arguments": ""}
+        for attempt in range(self.max_retries + 1):
+            tool_calls: dict[int, dict[str, str]] = {}
+            reasoning_parts: list[str] = []
+            # 每次尝试都使用全新的缓冲区，失败重试不会混入上一次的不完整内容。
+            content_parts: list[str] = []
+            visible_filter = _VisibleContentFilter()
+            emitted_visible = False
+            try:
+                async with self._http.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                ) as response:
+                    if response.status_code != 200:
+                        if (
+                            self._is_retryable_status(response.status_code)
+                            and attempt < self.max_retries
+                        ):
+                            await self._wait_before_retry(
+                                attempt=attempt,
+                                request_id=request_id,
+                                reason="http_status",
+                                status_code=response.status_code,
+                            )
+                            continue
+                        get_logger().warning(
+                            "llm_stream_http_error",
+                            extra={
+                                "request_id": request_id,
+                                "provider": self.provider,
+                                "model": self.model,
+                                "status_code": response.status_code,
+                                "attempts": attempt + 1,
+                            },
                         )
-                        if tool_call.get("id"):
-                            entry["id"] = tool_call["id"]
-                        function = tool_call.get("function") or {}
-                        if function.get("name"):
-                            entry["name"] += function["name"]
-                        if function.get("arguments"):
-                            entry["arguments"] += function["arguments"]
-                for visible_text in visible_filter.finish():
-                    if visible_text:
-                        yield StreamEvent(kind="delta", text=visible_text)
-        except httpx.TimeoutException as exc:
-            get_logger().warning(
-                "llm_stream_timeout",
-                extra={
-                    "request_id": request_id,
-                    "provider": self.provider,
-                    "model": self.model,
-                },
-            )
-            raise ChatProviderError(
-                code="LLM_TIMEOUT",
-                message="The AI provider did not respond in time.",
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise ChatProviderError(
-                code="LLM_NETWORK_ERROR",
-                message="Failed to reach the AI provider.",
-            ) from exc
+                        raise ChatProviderError(
+                            code="LLM_UPSTREAM_ERROR",
+                            message="The AI provider returned an error.",
+                        )
+
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            choice = json.loads(data)["choices"][0]
+                        except (KeyError, IndexError, TypeError, ValueError):
+                            continue
+                        delta = choice.get("delta", {})
+                        content = delta.get("content")
+                        if content:
+                            content_parts.append(content)
+                            for visible_text in visible_filter.feed(content):
+                                if visible_text:
+                                    emitted_visible = True
+                                    yield StreamEvent(kind="delta", text=visible_text)
+                        # 推理型模型的思考内容：需要随工具调用一并回传。
+                        reasoning = delta.get("reasoning_content")
+                        if reasoning:
+                            reasoning_parts.append(reasoning)
+                        for tool_call in delta.get("tool_calls") or []:
+                            idx = int(tool_call.get("index", 0))
+                            entry = tool_calls.setdefault(
+                                idx, {"id": "", "name": "", "arguments": ""}
+                            )
+                            if tool_call.get("id"):
+                                entry["id"] = tool_call["id"]
+                            function = tool_call.get("function") or {}
+                            if function.get("name"):
+                                entry["name"] += function["name"]
+                            if function.get("arguments"):
+                                entry["arguments"] += function["arguments"]
+                    for visible_text in visible_filter.finish():
+                        if visible_text:
+                            emitted_visible = True
+                            yield StreamEvent(kind="delta", text=visible_text)
+                break
+            except httpx.TimeoutException as exc:
+                if not emitted_visible and attempt < self.max_retries:
+                    await self._wait_before_retry(
+                        attempt=attempt,
+                        request_id=request_id,
+                        reason="timeout",
+                    )
+                    continue
+                get_logger().warning(
+                    "llm_stream_timeout",
+                    extra={
+                        "request_id": request_id,
+                        "provider": self.provider,
+                        "model": self.model,
+                        "attempts": attempt + 1,
+                        "partial_response": emitted_visible,
+                    },
+                )
+                raise ChatProviderError(
+                    code="LLM_TIMEOUT",
+                    message="The AI provider did not respond in time.",
+                ) from exc
+            except httpx.TransportError as exc:
+                if not emitted_visible and attempt < self.max_retries:
+                    await self._wait_before_retry(
+                        attempt=attempt,
+                        request_id=request_id,
+                        reason="network_error",
+                    )
+                    continue
+                get_logger().warning(
+                    "llm_stream_network_error",
+                    extra={
+                        "request_id": request_id,
+                        "provider": self.provider,
+                        "model": self.model,
+                        "attempts": attempt + 1,
+                        "partial_response": emitted_visible,
+                    },
+                )
+                raise ChatProviderError(
+                    code="LLM_NETWORK_ERROR",
+                    message="Failed to reach the AI provider.",
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise ChatProviderError(
+                    code="LLM_NETWORK_ERROR",
+                    message="Failed to reach the AI provider.",
+                ) from exc
 
         get_logger().info(
             "llm_stream",

@@ -11,6 +11,8 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
       LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
+      LLM_RETRY_BASE_DELAY_SECONDS: ${LLM_RETRY_BASE_DELAY_SECONDS:-0.5}
       SAAS_PRODUCT_NAME: ${SAAS_PRODUCT_NAME:-云枢 CloudHub}
       SAAS_COMPANY_NAME: ${SAAS_COMPANY_NAME:-云枢科技}
       # RAG 知识库：目录随后端镜像/挂载进入 /app/knowledge_base。

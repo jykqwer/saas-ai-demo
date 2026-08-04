@@ -4,25 +4,159 @@ import asyncio
 import json
 
 import httpx
+import pytest
 
-from core.llm import LLMClient, strip_text_tool_calls
+from core.llm import ChatProviderError, LLMClient, strip_text_tool_calls
 
 
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
-def _make_client(handler) -> LLMClient:
+def _make_client(handler, *, max_retries: int = 2) -> LLMClient:
     client = LLMClient(
         api_key="sk-test",
         base_url="https://api.deepseek.com",
         model="deepseek-chat",
         timeout_seconds=10,
         max_context_turns=5,
+        max_retries=max_retries,
+        retry_base_delay_seconds=0,
         mock_reply=None,
     )
     client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return client
+
+
+def test_chat_retries_retryable_http_status() -> None:
+    """非流式请求遇到 503 后应自动重试，并返回后续成功结果。"""
+
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "恢复成功"}}],
+                "usage": {"total_tokens": 10},
+            },
+        )
+
+    client = _make_client(handler)
+
+    async def run():
+        result = await client.chat(
+            messages=[{"role": "user", "content": "测试"}],
+            request_id="req_chat_retry",
+        )
+        await client.close()
+        return result
+
+    result = _run(run())
+    assert attempts == 2
+    assert result.text == "恢复成功"
+
+
+def test_stream_round_retries_retryable_http_status() -> None:
+    """流式请求尚未输出内容时，503 应自动重试且不产生重复文本。"""
+
+    attempts = 0
+    sse = 'data: {"choices":[{"delta":{"content":"恢复成功"}}]}\n\ndata: [DONE]\n\n'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503)
+        return httpx.Response(
+            200, text=sse, headers={"content-type": "text/event-stream"}
+        )
+
+    client = _make_client(handler)
+
+    async def run():
+        events = [
+            event
+            async for event in client.stream_round(
+                messages=[{"role": "user", "content": "测试"}],
+                request_id="req_stream_retry",
+            )
+        ]
+        await client.close()
+        return events
+
+    events = _run(run())
+    assert attempts == 2
+    assert [event.text for event in events if event.kind == "delta"] == ["恢复成功"]
+
+
+def test_stream_round_does_not_retry_non_retryable_status() -> None:
+    """鉴权和请求参数类错误应立即失败，避免无效重试与额外费用。"""
+
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(401)
+
+    client = _make_client(handler)
+
+    async def run():
+        with pytest.raises(ChatProviderError) as caught:
+            async for _ in client.stream_round(
+                messages=[{"role": "user", "content": "测试"}],
+                request_id="req_no_retry",
+            ):
+                pass
+        await client.close()
+        return caught.value
+
+    error = _run(run())
+    assert attempts == 1
+    assert error.code == "LLM_UPSTREAM_ERROR"
+
+
+def test_stream_round_does_not_retry_after_visible_delta() -> None:
+    """流式文本已经交给前端后发生断连时，不得重试并重复回答开头。"""
+
+    attempts = 0
+
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield ('data: {"choices":[{"delta":{"content":"已输出"}}]}\n\n'.encode())
+            raise httpx.ReadError("upstream disconnected")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            200,
+            stream=BrokenStream(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = _make_client(handler)
+
+    async def run():
+        stream = client.stream_round(
+            messages=[{"role": "user", "content": "测试"}],
+            request_id="req_partial_stream",
+        )
+        first = await anext(stream)
+        with pytest.raises(ChatProviderError) as caught:
+            await anext(stream)
+        await client.close()
+        return first, caught.value
+
+    first, error = _run(run())
+    assert attempts == 1
+    assert first.text == "已输出"
+    assert error.code == "LLM_NETWORK_ERROR"
 
 
 def test_stream_round_detects_text_tool_call() -> None:

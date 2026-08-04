@@ -592,8 +592,17 @@ export default function ChatPage({
             </div>
           )}
           <div className="chat-input-wrap">
-            <label className={`image-upload-btn ${config?.vision_configured ? '' : 'disabled'}`} title="添加图片">
-              🖼
+            <label
+              className={`image-upload-btn ${config?.vision_configured ? '' : 'disabled'}`}
+              title="上传图片"
+              aria-label="上传图片"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="3" y="4" width="14" height="16" rx="2" />
+                <circle cx="8" cy="9" r="1.5" />
+                <path d="m5.5 17 3.8-4 2.7 2.7 2-2.2 3 3.2" />
+                <path d="M19 7v6M16 10h6" />
+              </svg>
               <input
                 type="file"
                 accept="image/png,image/jpeg,image/webp"

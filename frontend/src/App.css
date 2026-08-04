@@ -487,10 +487,28 @@
   height: 38px;
   display: grid;
   place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 10px;
   cursor: pointer;
   flex-shrink: 0;
   background: rgba(255, 255, 255, 0.06);
+  color: rgba(238, 241, 255, 0.68);
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+.image-upload-btn:not(.disabled):hover,
+.image-upload-btn:focus-within {
+  color: #fff;
+  background: rgba(124, 92, 255, 0.18);
+  border-color: rgba(124, 92, 255, 0.55);
+}
+.image-upload-btn svg {
+  width: 21px;
+  height: 21px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 .image-upload-btn.disabled {
   opacity: 0.35;

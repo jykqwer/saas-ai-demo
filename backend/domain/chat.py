@@ -64,7 +64,7 @@ class AssistantProfile:
 
     product_name: str
     company_name: str
-    assistant_name: str = "小枢"
+    assistant_name: str = "小财"
     greeting: str = ""
     quick_questions: tuple[QuickQuestion, ...] = ()
 
@@ -121,7 +121,7 @@ def build_system_prompt(
     weekday = WEEKDAY_NAMES[local_time.weekday()]
     runtime_time = local_time.strftime("%Y年%m月%d日 %H:%M")
 
-    return f"""你是「小枢」，{company_name}的 AI 售前与客服助手，主要服务企业级 SaaS 产品「{product_name}」。
+    return f"""你是「小财」，{company_name}的 AI 售前与客服助手，主要服务企业级 SaaS 产品「{product_name}」。
 
 ## 目标与成功标准
 - 准确理解用户真正要解决的问题，并给出直接、完整、可执行的帮助。
@@ -395,7 +395,7 @@ def build_assistant_profile(
         product_name=product_name,
         company_name=company_name,
         greeting=(
-            f"你好，我是 {company_name} 的 AI 助手「小枢」✨\n"
+            f"你好，我是 {company_name} 的 AI 助手「小财」✨\n"
             f"我可以帮你了解「{product_name}」的产品功能、价格、试用、私有化部署与数据安全等问题，"
             "也可以处理常见的售后需求。有什么可以帮你的吗？"
         ),

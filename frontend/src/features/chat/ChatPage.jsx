@@ -391,7 +391,7 @@ export default function ChatPage({
           </div>
           <div>
             <div className="brand-name">
-              {config?.assistant_name ?? '小枢'}
+              {config?.assistant_name ?? '小财'}
             </div>
             <div className="brand-sub">{config?.product_name ?? 'SaaS AI 助手'}</div>
           </div>
@@ -507,7 +507,7 @@ export default function ChatPage({
         <header className="chat-header">
           <div>
             <h1>
-              {config?.assistant_name ?? '小枢'} · {config?.product_name ?? 'SaaS AI 助手'}
+              {config?.assistant_name ?? '小财'} · {config?.product_name ?? 'SaaS AI 助手'}
             </h1>
             <div className="hint">
               {configured ? '由真实大模型驱动' : '演示模式，配置 LLM_API_KEY 后接入真实大模型'}
@@ -559,7 +559,7 @@ export default function ChatPage({
               <div className="welcome-avatar" aria-hidden="true">
                 💬
               </div>
-              <h2>你好，我是 {config?.assistant_name ?? '小枢'}</h2>
+              <h2>你好，我是 {config?.assistant_name ?? '小财'}</h2>
               <p>
                 {config?.greeting ??
                   '我可以帮你了解产品、价格、试用与部署，也可以处理售后问题。'}
